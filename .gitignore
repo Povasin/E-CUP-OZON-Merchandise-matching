@@ -1,4 +1,22 @@
-/venv
-.env
-/.vscode
-/data
+# IDE
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Data assets (large; kept locally, see docs/ASSETS.md)
+assets/*.parquet
+
+# Models / heavy artifacts pulled locally
+examples/matching-baseline-submit/
+*.log
+
+# Local outputs
+/output/
+submit*.csv
