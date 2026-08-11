@@ -4,3 +4,7 @@ pandas
 pyarrow
 numpy
 scikit-learn
+
+# v2 (метод embed) — тяжёлые, ставить только для экспериментов с эмбеддингами:
+# torch
+# sentence-transformers
