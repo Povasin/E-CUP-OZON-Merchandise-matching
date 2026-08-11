@@ -14,6 +14,7 @@ from src.scoring import score_pairs
 
 
 DEFAULT_MODEL_PATH = os.environ.get("PAIR_MODEL_PATH", "models/pair_logreg.npz")
+DEFAULT_BOOST_MODEL_PATH = os.environ.get("PAIR_BOOST_MODEL_PATH", "models/pair_boost.npz")
 
 
 def predict_scores(
@@ -26,13 +27,17 @@ def predict_scores(
     """Score input pairs while preserving their order."""
     if pairs is None:
         pairs = attach_texts(matches, items)
-    if method == "supervised":
+    if method in {"supervised", "boosted"}:
         from src.features import extract_model_features
-        from src.model import PairModel
+        from src.model import BoostedPairModel, PairModel
 
-        model_path = scorer_kwargs.pop("model_path", DEFAULT_MODEL_PATH)
         features = extract_model_features(matches, items)
-        scores = PairModel(model_path).predict(features, pairs["category"].to_numpy())
+        if method == "boosted":
+            model_path = scorer_kwargs.pop("model_path", DEFAULT_BOOST_MODEL_PATH)
+            scores = BoostedPairModel(model_path).predict(features, pairs["category"].to_numpy())
+        else:
+            model_path = scorer_kwargs.pop("model_path", DEFAULT_MODEL_PATH)
+            scores = PairModel(model_path).predict(features, pairs["category"].to_numpy())
         missing = (pairs["text1"] == "").to_numpy() | (pairs["text2"] == "").to_numpy()
         scores[missing] = 0.0
     else:

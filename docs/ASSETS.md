@@ -2,7 +2,7 @@
 
 - `assets/matches.parquet` — 4.1MB, данные с ручной разметкой пар товаров
 - `assets/matches_llm.parquet` — 104.7MB, данные с разметкой пар товаров с помощью LLM
-- `assets/items.parquet` — 4.1GB, полные данные с информацией о товарах ⚠️ **не скачан, в репозитории отсутствует**
+- `assets/items.parquet` — 4.1GB, полные данные с информацией о товарах
 - `assets/items_human.parquet` — 214.2MB, подмножество данных о товарах, что присутствуют только в данных ручной разметки пар
 
 ## Глоссарий для `matches.parquet` и `matches_llm.parquet`
