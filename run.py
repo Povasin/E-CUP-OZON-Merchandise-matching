@@ -3,15 +3,14 @@
     python -u run.py --items_path items.parquet --matches_path matches.parquet \
                      --output_path submit.csv
 
-Метод скоринга можно переопределить переменной окружения MATCH_METHOD (по
-умолчанию 'tfidf' — прямое решение без обучения).
+Метод скоринга можно переопределить переменной окружения MATCH_METHOD.
 """
 import argparse
 import os
 
 from src.pipeline import predict_pipeline
 
-METHOD = os.environ.get("MATCH_METHOD", "tfidf")
+METHOD = os.environ.get("MATCH_METHOD", "supervised")
 
 
 def main() -> None:

@@ -4,12 +4,40 @@
 """
 from __future__ import annotations
 
+import os
 import time
 
 import pandas as pd
 
 from src.data import attach_texts, load_items, load_matches
 from src.scoring import score_pairs
+
+
+DEFAULT_MODEL_PATH = os.environ.get("PAIR_MODEL_PATH", "models/pair_logreg.npz")
+
+
+def predict_scores(
+    matches: pd.DataFrame,
+    items: pd.DataFrame,
+    method: str,
+    pairs: pd.DataFrame | None = None,
+    **scorer_kwargs,
+) -> tuple[pd.DataFrame, object]:
+    """Score input pairs while preserving their order."""
+    if pairs is None:
+        pairs = attach_texts(matches, items)
+    if method == "supervised":
+        from src.features import extract_model_features
+        from src.model import PairModel
+
+        model_path = scorer_kwargs.pop("model_path", DEFAULT_MODEL_PATH)
+        features = extract_model_features(matches, items)
+        scores = PairModel(model_path).predict(features, pairs["category"].to_numpy())
+        missing = (pairs["text1"] == "").to_numpy() | (pairs["text2"] == "").to_numpy()
+        scores[missing] = 0.0
+    else:
+        scores = score_pairs(pairs, method=method, **scorer_kwargs)
+    return pairs, scores
 
 
 def predict_pipeline(
@@ -30,7 +58,7 @@ def predict_pipeline(
     print(f"      пар: {len(pairs)} | сторон без текста: {n_missing}")
 
     print(f"[3/4] Скоринг методом '{method}'")
-    scores = score_pairs(pairs, method=method, **scorer_kwargs)
+    pairs, scores = predict_scores(matches, items, method=method, pairs=pairs, **scorer_kwargs)
 
     print(f"[4/4] Сохранение результата: {output_path}")
     result = pd.DataFrame(

@@ -40,10 +40,10 @@ def build_item_text(items: pd.DataFrame, use_category: bool = False) -> pd.Serie
 
 
 def load_items(items_path: str, use_category: bool = False) -> pd.DataFrame:
-    """Прочитать товары и вернуть DataFrame с колонками id, text, category."""
+    """Прочитать товары, сохранив сырые поля для обучаемого скорера."""
     items = pd.read_parquet(items_path, columns=["id", "name", "attributes", "category"])
     items["text"] = build_item_text(items, use_category=use_category)
-    return items[["id", "text", "category"]]
+    return items[["id", "name", "attributes", "text", "category"]]
 
 
 def load_matches(matches_path: str) -> pd.DataFrame:

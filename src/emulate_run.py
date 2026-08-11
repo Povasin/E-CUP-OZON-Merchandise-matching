@@ -161,7 +161,7 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=1234)
     args = ap.parse_args()
 
-    method = os.environ.get("MATCH_METHOD", "tfidf")
+    method = os.environ.get("MATCH_METHOD", "supervised")
     print(f"Метод скоринга: {method}  (MATCH_METHOD)")
 
     stages = list(STAGES) if args.stage == "all" else [args.stage]
