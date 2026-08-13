@@ -6,6 +6,7 @@ products.  This is important for the competition test, where every product is ne
 from __future__ import annotations
 
 import json
+import math
 import re
 from dataclasses import dataclass
 
@@ -68,17 +69,21 @@ class ProductView:
     name: str
     name_tokens: frozenset[str]
     name_grams: frozenset[str]
+    name_grams4: frozenset[str]
+    name_grams5: frozenset[str]
     attrs: dict[str, str]
     attr_keys: frozenset[str]
     value_tokens: frozenset[str]
     all_tokens: frozenset[str]
     digit_tokens: frozenset[str]
+    num_values: frozenset[float]
     article_tokens: frozenset[str]
     brand_tokens: frozenset[str]
 
 
-EMPTY_VIEW = ProductView("", frozenset(), frozenset(), {}, frozenset(), frozenset(),
-                         frozenset(), frozenset(), frozenset(), frozenset())
+EMPTY_VIEW = ProductView("", frozenset(), frozenset(), frozenset(), frozenset(), {},
+                         frozenset(), frozenset(), frozenset(), frozenset(), frozenset(),
+                         frozenset(), frozenset())
 
 
 def _make_view(name: object, raw_attrs: object) -> ProductView:
@@ -88,15 +93,19 @@ def _make_view(name: object, raw_attrs: object) -> ProductView:
     value_tokens = frozenset(token for value in attrs.values() for token in value.split())
     all_tokens = name_tokens | value_tokens
     digit_tokens = frozenset(token for token in all_tokens if any(ch.isdigit() for ch in token))
+    num_values = frozenset(float(token) for token in all_tokens if token.isdigit())
     return ProductView(
         name=norm_name,
         name_tokens=name_tokens,
         name_grams=_char_ngrams(norm_name),
+        name_grams4=_char_ngrams(norm_name, 4),
+        name_grams5=_char_ngrams(norm_name, 5),
         attrs=attrs,
         attr_keys=frozenset(attrs),
         value_tokens=value_tokens,
         all_tokens=all_tokens,
         digit_tokens=digit_tokens,
+        num_values=num_values,
         article_tokens=_selected_values(attrs, ARTICLE_KEYS),
         brand_tokens=_selected_values(attrs, BRAND_KEYS),
     )
@@ -110,6 +119,35 @@ def build_product_views(items: pd.DataFrame) -> dict[int, ProductView]:
     }
 
 
+def _build_idf(values, attr: bool) -> tuple[dict[str, float], float]:
+    """Document-frequency IDF over the run corpus (name or attribute tokens)."""
+    document_frequency: dict[str, int] = {}
+    n_documents = 0
+    for view in values:
+        n_documents += 1
+        tokens = view.value_tokens if attr else view.name_tokens
+        for token in tokens:
+            document_frequency[token] = document_frequency.get(token, 0) + 1
+    idf = {t: math.log((n_documents + 1) / (c + 1)) + 1.0 for t, c in document_frequency.items()}
+    max_idf = math.log(n_documents + 1) + 1.0
+    return idf, max_idf
+
+
+def _weighted_overlap(
+    left: frozenset[str], right: frozenset[str], idf: dict[str, float]
+) -> tuple[float, float]:
+    if not left or not right:
+        return 0.0, 0.0
+    weight_inter = sum(idf.get(t, 1.0) for t in left & right)
+    weight_union = sum(idf.get(t, 1.0) for t in left | right)
+    weight_min = min(
+        sum(idf.get(t, 1.0) for t in left), sum(idf.get(t, 1.0) for t in right)
+    )
+    jaccard = weight_inter / weight_union if weight_union else 0.0
+    containment = weight_inter / weight_min if weight_min else 0.0
+    return jaccard, containment
+
+
 def _set_stats(left: frozenset[str], right: frozenset[str]) -> tuple[float, float, float, float]:
     if not left and not right:
         return 0.0, 0.0, 0.0, 0.0
@@ -120,6 +158,86 @@ def _set_stats(left: frozenset[str], right: frozenset[str]) -> tuple[float, floa
     containment = common / min(len(left), len(right)) if left and right else 0.0
     count_ratio = min(len(left), len(right)) / max(len(left), len(right)) if left and right else 0.0
     return jaccard, dice, containment, count_ratio
+
+
+def _extra_features(
+    left: ProductView,
+    right: ProductView,
+    name_idf: dict[str, float],
+    name_max_idf: float,
+    attr_idf: dict[str, float],
+) -> list[float]:
+    """IDF-weighted, numeric and finer-grained relational signals."""
+    left_names, right_names = left.name_tokens, right.name_tokens
+
+    idf_jaccard, idf_containment = _weighted_overlap(left_names, right_names, name_idf)
+
+    shared = left_names & right_names
+    only = (left_names - right_names) | (right_names - left_names)
+    max_shared = max((name_idf.get(t, 1.0) for t in shared), default=0.0) / name_max_idf
+    max_unshared = max((name_idf.get(t, 1.0) for t in only), default=0.0) / name_max_idf
+    rarest_left = max(left_names, key=lambda t: name_idf.get(t, 1.0)) if left_names else None
+    rarest_right = max(right_names, key=lambda t: name_idf.get(t, 1.0)) if right_names else None
+    rarest_shared = float(
+        rarest_left is not None and rarest_left in right_names
+        and rarest_right is not None and rarest_right in left_names
+    )
+
+    intersection = len(shared)
+    extra_left = len(left_names - right_names)
+    extra_right = len(right_names - left_names)
+    denom = intersection + extra_left + extra_right
+    extra_min = min(extra_left, extra_right) / denom if denom else 0.0
+    extra_max = max(extra_left, extra_right) / denom if denom else 0.0
+
+    left_nums, right_nums = left.num_values, right.num_values
+    if left_nums and right_nums:
+        common = len(left_nums & right_nums)
+        num_jaccard = common / len(left_nums | right_nums)
+        num_containment = common / min(len(left_nums), len(right_nums))
+        num_disjoint = float(common == 0)
+    else:
+        num_jaccard = num_containment = num_disjoint = 0.0
+    num_presence_equal = float(bool(left_nums) == bool(right_nums))
+
+    grams4 = _set_stats(left.name_grams4, right.name_grams4)
+    grams5 = _set_stats(left.name_grams5, right.name_grams5)
+
+    attr_jaccard, attr_containment = _weighted_overlap(left.value_tokens, right.value_tokens, attr_idf)
+
+    left_tokens_list = left.name.split()
+    right_tokens_list = right.name.split()
+    first_match = float(
+        bool(left_tokens_list) and bool(right_tokens_list)
+        and left_tokens_list[0] == right_tokens_list[0]
+    )
+    last_match = float(
+        bool(left_tokens_list) and bool(right_tokens_list)
+        and left_tokens_list[-1] == right_tokens_list[-1]
+    )
+
+    return [
+        idf_jaccard, idf_containment,
+        extra_min, extra_max,
+        num_jaccard, num_containment, num_disjoint, num_presence_equal,
+        grams4[0], grams4[2],
+        first_match, last_match,
+        max_shared, max_unshared, rarest_shared,
+        attr_jaccard, attr_containment,
+        grams5[0], grams5[2],
+    ]
+
+
+EXTRA_FEATURE_NAMES = [
+    "idf_name_jaccard", "idf_name_containment",
+    "name_extra_min", "name_extra_max",
+    "num_jaccard", "num_containment", "num_disjoint", "num_presence_equal",
+    "name_char4_jaccard", "name_char4_containment",
+    "name_first_match", "name_last_match",
+    "idf_max_shared", "idf_max_unshared", "idf_rarest_shared",
+    "attr_idf_jaccard", "attr_idf_containment",
+    "name_char5_jaccard", "name_char5_containment",
+]
 
 
 def _pair_features(left: ProductView, right: ProductView) -> list[float]:
@@ -189,7 +307,7 @@ FEATURE_NAMES = [
     "article_jaccard", "article_containment", "article_count_ratio", "article_disjoint",
     "article_presence_equal", "brand_jaccard", "brand_containment", "brand_exact",
     "brand_disjoint", "brand_presence_equal",
-]
+] + EXTRA_FEATURE_NAMES
 
 MODEL_FEATURE_NAMES = FEATURE_NAMES + ["text_tfidf", "name_tfidf"]
 
@@ -197,9 +315,15 @@ MODEL_FEATURE_NAMES = FEATURE_NAMES + ["text_tfidf", "name_tfidf"]
 def extract_pair_features(matches: pd.DataFrame, items: pd.DataFrame) -> np.ndarray:
     """Return a dense float32 feature matrix in input-pair order."""
     views = build_product_views(items)
+    name_idf, name_max_idf = _build_idf(views.values(), attr=False)
+    attr_idf, _ = _build_idf(views.values(), attr=True)
     result = np.empty((len(matches), len(FEATURE_NAMES)), dtype=np.float32)
     for row, (id1, id2) in enumerate(matches[["id1", "id2"]].itertuples(index=False, name=None)):
-        result[row] = _pair_features(views.get(int(id1), EMPTY_VIEW), views.get(int(id2), EMPTY_VIEW))
+        left = views.get(int(id1), EMPTY_VIEW)
+        right = views.get(int(id2), EMPTY_VIEW)
+        result[row] = _pair_features(left, right) + _extra_features(
+            left, right, name_idf, name_max_idf, attr_idf
+        )
     return result
 
 

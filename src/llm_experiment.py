@@ -14,7 +14,7 @@ from sklearn.ensemble import HistGradientBoostingClassifier
 
 from src.features import MODEL_FEATURE_NAMES, extract_model_features
 from src.metrics import macro_pr_auc
-from src.train_model import make_validation_split
+from src.train_model import category_ranks, make_validation_split
 
 
 def build_llm_cache(
@@ -102,11 +102,14 @@ def main() -> None:
     parser.add_argument("--llm-matches", default="assets/matches_llm.parquet")
     parser.add_argument("--human-items", default="assets/items_human.parquet")
     parser.add_argument("--human-matches", default="assets/matches.parquet")
-    parser.add_argument("--human-features", default="output/pair_features_v3.npy")
+    parser.add_argument("--human-features", default="output/pair_features_v4.npy")
     parser.add_argument("--row-groups", default="all")
     parser.add_argument("--max-pairs-per-category-group", type=int, default=20_000)
-    parser.add_argument("--llm-features", default="output/llm_rg0_features.npy")
-    parser.add_argument("--llm-pairs", default="output/llm_rg0_pairs.parquet")
+    parser.add_argument("--llm-features", default="output/llm_all_features_v4.npy")
+    parser.add_argument("--llm-pairs", default="output/llm_all_pairs_v4.parquet")
+    parser.add_argument("--quick", action="store_true", help="Only human/LLM models and rank blends")
+    parser.add_argument("--hybrid-only", action="store_true", help="Only human and weight-10 hybrid")
+    parser.add_argument("--validation-split", choices=["random", "id-tail", "name-group"], default="id-tail")
     args = parser.parse_args()
 
     feature_path = Path(args.llm_features)
@@ -135,7 +138,7 @@ def main() -> None:
     category_by_id = dict(zip(human_items["id"], human_items["category"].astype(str)))
     human_categories = human_pairs["id1"].map(category_by_id).astype(str).to_numpy()
     train_idx, valid_idx = make_validation_split(
-        "id-tail", human_pairs, human_items, human_target, human_categories, 0.2, 2026
+        args.validation_split, human_pairs, human_items, human_target, human_categories, 0.2, 2026
     )
     valid_features = human_features[valid_idx]
     valid_target = human_target[valid_idx]
@@ -145,17 +148,45 @@ def main() -> None:
     llm_target = (llm_soft >= 0.5).astype(np.int8)
     llm_categories = llm_pairs["category"].astype(str).to_numpy()
 
-    print("\nManual id-tail validation:")
+    print(f"\nManual {args.validation_split} validation:")
     human_scores = fit_predict(
         human_features[train_idx], human_target[train_idx], human_categories[train_idx],
         valid_features, valid_categories,
     )
     report("human only", valid_target, human_scores, valid_categories)
 
+    if args.hybrid_only:
+        hybrid_features = np.vstack((llm_features, human_features[train_idx]))
+        hybrid_target = np.concatenate((llm_target, human_target[train_idx]))
+        hybrid_categories = np.concatenate((llm_categories, human_categories[train_idx]))
+        weights = np.concatenate((np.ones(len(llm_target), dtype=np.float32),
+                                  np.full(len(train_idx), 10.0, dtype=np.float32)))
+        hybrid_scores = fit_predict(
+            hybrid_features, hybrid_target, hybrid_categories,
+            valid_features, valid_categories, weights,
+        )
+        report("hybrid human_weight=10", valid_target, hybrid_scores, valid_categories)
+        _, human_per_category = macro_pr_auc(valid_target, human_scores, valid_categories)
+        _, hybrid_per_category = macro_pr_auc(valid_target, hybrid_scores, valid_categories)
+        print("Per-category hybrid delta:")
+        for category in sorted(human_per_category):
+            delta = hybrid_per_category[category] - human_per_category[category]
+            print(f"  {category:<28} {delta:+.5f}")
+        return
+
     llm_scores = fit_predict(
         llm_features, llm_target, llm_categories, valid_features, valid_categories
     )
     report("LLM all", valid_target, llm_scores, valid_categories)
+
+    human_rank = category_ranks(human_scores, valid_categories)
+    llm_rank = category_ranks(llm_scores, valid_categories)
+    for llm_weight in (0.05, 0.10, 0.20, 0.30):
+        blend = (1.0 - llm_weight) * human_rank + llm_weight * llm_rank
+        report(f"rank blend LLM={llm_weight:.2f}", valid_target, blend, valid_categories)
+
+    if args.quick:
+        return
 
     confident = (llm_soft == 0.0) | (llm_soft >= 8.0 / 9.0)
     confident_scores = fit_predict(

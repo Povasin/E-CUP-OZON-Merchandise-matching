@@ -16,13 +16,25 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--items", default="assets/items_human.parquet")
     parser.add_argument("--matches", default="assets/matches.parquet")
-    parser.add_argument("--feature-cache", default="output/pair_features_v3.npy")
+    parser.add_argument("--feature-cache", default="output/pair_features_v4.npy")
     parser.add_argument("--output", default="models/pair_boost.npz")
     parser.add_argument("--max-iter", type=int, default=250)
     parser.add_argument("--max-leaves", type=int, default=31)
     parser.add_argument("--min-leaf", type=int, default=40)
     parser.add_argument("--l2", type=float, default=2.0)
     parser.add_argument("--seed", type=int, default=2026)
+    parser.add_argument("--use-llm", action="store_true")
+    parser.add_argument("--llm-features", default="output/llm_all_features_v4.npy")
+    parser.add_argument("--llm-pairs", default="output/llm_all_pairs_v4.parquet")
+    parser.add_argument("--human-weight", type=float, default=10.0)
+    parser.add_argument(
+        "--hybrid-categories",
+        default=(
+            "Бытовая техника,Бытовая химия,Галантерея и аксессуары,Дом и сад,"
+            "Красота и гигиена,Продукты питания,Строительство и ремонт,"
+            "Электроника,Ювелирные изделия"
+        ),
+    )
     args = parser.parse_args()
 
     items = pd.read_parquet(args.items, columns=["id", "name", "attributes", "category"])
@@ -44,6 +56,19 @@ def main() -> None:
     categories = matches["id1"].map(category_by_id).astype(str).to_numpy()
     model_names = np.asarray(sorted(np.unique(categories).tolist()) + [FALLBACK_CATEGORY])
 
+    hybrid_categories = {value.strip() for value in args.hybrid_categories.split(",") if value.strip()}
+    llm_features = None
+    llm_target = None
+    llm_categories = None
+    if args.use_llm:
+        llm_features = np.load(args.llm_features, mmap_mode="r")
+        llm_pairs = pd.read_parquet(args.llm_pairs, columns=["target", "category"])
+        if len(llm_features) != len(llm_pairs):
+            raise ValueError("LLM feature and pair caches have different lengths")
+        llm_target = (llm_pairs["target"].to_numpy(dtype=np.float32) >= 0.5).astype(np.int8)
+        llm_categories = llm_pairs["category"].astype(str).to_numpy()
+        print(f"Selective LLM hybrid categories: {sorted(hybrid_categories)}")
+
     max_nodes = 2 * args.max_leaves - 1
     shape = (len(model_names), args.max_iter, max_nodes)
     feature_idx = np.zeros(shape, dtype=np.int16)
@@ -58,7 +83,21 @@ def main() -> None:
 
     for model_row, category in enumerate(model_names):
         rows = np.arange(len(matches)) if category == FALLBACK_CATEGORY else np.flatnonzero(categories == category)
-        print(f"Training {category}: {len(rows)} pairs", flush=True)
+        fit_features = features[rows]
+        fit_target = target[rows]
+        sample_weight = None
+        source = "human"
+        if args.use_llm and category in hybrid_categories:
+            assert llm_features is not None and llm_target is not None and llm_categories is not None
+            llm_rows = np.flatnonzero(llm_categories == category)
+            fit_features = np.vstack((llm_features[llm_rows], fit_features))
+            fit_target = np.concatenate((llm_target[llm_rows], fit_target))
+            sample_weight = np.concatenate((
+                np.ones(len(llm_rows), dtype=np.float32),
+                np.full(len(rows), args.human_weight, dtype=np.float32),
+            ))
+            source = f"hybrid(llm={len(llm_rows)}, human={len(rows)}x{args.human_weight:g})"
+        print(f"Training {category}: {len(fit_target)} pairs [{source}]", flush=True)
         model = HistGradientBoostingClassifier(
             learning_rate=0.05,
             max_iter=args.max_iter,
@@ -68,7 +107,7 @@ def main() -> None:
             early_stopping=False,
             random_state=args.seed,
         )
-        model.fit(features[rows], target[rows])
+        model.fit(fit_features, fit_target, sample_weight=sample_weight)
         baseline[model_row] = float(model._baseline_prediction.ravel()[0])
         if len(model._predictors) != args.max_iter:
             raise ValueError(f"Unexpected number of trees for {category}: {len(model._predictors)}")

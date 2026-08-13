@@ -14,7 +14,7 @@ from src.scoring import score_pairs
 
 
 DEFAULT_MODEL_PATH = os.environ.get("PAIR_MODEL_PATH", "models/pair_logreg.npz")
-DEFAULT_BOOST_MODEL_PATH = os.environ.get("PAIR_BOOST_MODEL_PATH", "models/pair_boost.npz")
+DEFAULT_BOOST_MODEL_PATH = os.environ.get("PAIR_BOOST_MODEL_PATH", "models/pair_boost_hybrid.npz")
 
 
 def predict_scores(
