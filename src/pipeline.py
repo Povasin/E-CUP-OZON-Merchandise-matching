@@ -15,6 +15,10 @@ from src.scoring import score_pairs
 
 DEFAULT_MODEL_PATH = os.environ.get("PAIR_MODEL_PATH", "models/pair_logreg.npz")
 DEFAULT_BOOST_MODEL_PATH = os.environ.get("PAIR_BOOST_MODEL_PATH", "models/pair_boost_hybrid.npz")
+DEFAULT_BOOST_AUX_MODEL_PATH = os.environ.get(
+    "PAIR_BOOST_AUX_MODEL_PATH", "models/pair_boost_hybrid_aux.npz"
+)
+DEFAULT_BOOST_AUX_WEIGHT = float(os.environ.get("PAIR_BOOST_AUX_WEIGHT", "0.20"))
 
 
 def predict_scores(
@@ -34,7 +38,20 @@ def predict_scores(
         features = extract_model_features(matches, items)
         if method == "boosted":
             model_path = scorer_kwargs.pop("model_path", DEFAULT_BOOST_MODEL_PATH)
-            scores = BoostedPairModel(model_path).predict(features, pairs["category"].to_numpy())
+            aux_model_path = scorer_kwargs.pop("aux_model_path", DEFAULT_BOOST_AUX_MODEL_PATH)
+            aux_weight = float(scorer_kwargs.pop("aux_weight", DEFAULT_BOOST_AUX_WEIGHT))
+            if not 0.0 <= aux_weight <= 1.0:
+                raise ValueError("aux_weight must be between 0 and 1")
+            categories = pairs["category"].to_numpy()
+            model = BoostedPairModel(model_path)
+            if aux_model_path and aux_weight:
+                primary = model.predict_probability(features, categories)
+                auxiliary = BoostedPairModel(aux_model_path).predict_probability(
+                    features, categories
+                )
+                scores = (1.0 - aux_weight) * primary + aux_weight * auxiliary
+            else:
+                scores = model.predict(features, categories)
         else:
             model_path = scorer_kwargs.pop("model_path", DEFAULT_MODEL_PATH)
             scores = PairModel(model_path).predict(features, pairs["category"].to_numpy())

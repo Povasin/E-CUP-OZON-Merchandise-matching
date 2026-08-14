@@ -16,7 +16,14 @@ assets/*.parquet
 # Models / heavy artifacts pulled locally
 examples/matching-baseline-submit/
 *.log
+.DS_Store
+/models/cross-encoder-ms-marco-MiniLM-L12-v2/
+/models/gte-multilingual-reranker-base/
+/models/minilm-product-matcher/
+/models/gte_pair_heads.npz
+/models/minilm_l12_head.npz
 
 # Local outputs
 /output/
 submit*.csv
+matching-submit.zip

@@ -13,6 +13,7 @@ import pyarrow.parquet as pq
 from sklearn.ensemble import HistGradientBoostingClassifier
 
 from src.features import MODEL_FEATURE_NAMES, extract_model_features
+from src.hybrid import confident_llm_mask
 from src.metrics import macro_pr_auc
 from src.train_model import category_ranks, make_validation_split
 
@@ -102,11 +103,11 @@ def main() -> None:
     parser.add_argument("--llm-matches", default="assets/matches_llm.parquet")
     parser.add_argument("--human-items", default="assets/items_human.parquet")
     parser.add_argument("--human-matches", default="assets/matches.parquet")
-    parser.add_argument("--human-features", default="output/pair_features_v4.npy")
+    parser.add_argument("--human-features", default="output/pair_features_v6.npy")
     parser.add_argument("--row-groups", default="all")
     parser.add_argument("--max-pairs-per-category-group", type=int, default=20_000)
-    parser.add_argument("--llm-features", default="output/llm_all_features_v4.npy")
-    parser.add_argument("--llm-pairs", default="output/llm_all_pairs_v4.parquet")
+    parser.add_argument("--llm-features", default="output/llm_all_features_v6.npy")
+    parser.add_argument("--llm-pairs", default="output/llm_all_pairs_v6.parquet")
     parser.add_argument("--quick", action="store_true", help="Only human/LLM models and rank blends")
     parser.add_argument("--hybrid-only", action="store_true", help="Only human and weight-10 hybrid")
     parser.add_argument("--validation-split", choices=["random", "id-tail", "name-group"], default="id-tail")
@@ -188,7 +189,7 @@ def main() -> None:
     if args.quick:
         return
 
-    confident = (llm_soft == 0.0) | (llm_soft >= 8.0 / 9.0)
+    confident = confident_llm_mask(llm_soft)
     confident_scores = fit_predict(
         llm_features[confident], llm_target[confident], llm_categories[confident],
         valid_features, valid_categories,

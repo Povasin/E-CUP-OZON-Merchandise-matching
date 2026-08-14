@@ -104,3 +104,8 @@ class BoostedPairModel:
             model_row = self.category_to_row.get(category, self.fallback_row)
             scores[mask] = self._predict_model(features[mask], model_row)
         return scores
+
+    def predict_probability(self, features: np.ndarray, categories: np.ndarray) -> np.ndarray:
+        """Return positive-class probability from the portable raw tree score."""
+        raw = self.predict(features, categories)
+        return 1.0 / (1.0 + np.exp(-np.clip(raw, -80.0, 80.0)))
