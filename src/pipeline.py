@@ -6,7 +6,9 @@ from __future__ import annotations
 
 import os
 import time
+from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from src.data import attach_texts, load_items, load_matches
@@ -19,6 +21,92 @@ DEFAULT_BOOST_AUX_MODEL_PATH = os.environ.get(
     "PAIR_BOOST_AUX_MODEL_PATH", "models/pair_boost_hybrid_aux.npz"
 )
 DEFAULT_BOOST_AUX_WEIGHT = float(os.environ.get("PAIR_BOOST_AUX_WEIGHT", "0.20"))
+DEFAULT_CE_DIR = os.environ.get("PAIR_CE_DIR", "models/cross_encoder")
+DEFAULT_BLEND_WEIGHTS = os.environ.get("PAIR_BLEND_WEIGHTS", "models/blend_weights.npz")
+DEFAULT_CE_BATCH = int(os.environ.get("PAIR_CE_BATCH", "512"))
+
+
+def _category_ranks(scores, categories):
+    frame = pd.DataFrame({"score": scores, "category": categories})
+    return frame.groupby("category", sort=False)["score"].rank(pct=True).to_numpy(dtype=np.float32)
+
+
+def _cross_encoder_scores(matches: pd.DataFrame, items: pd.DataFrame) -> np.ndarray:
+    """Логиты дообученного кросс-энкодера в порядке входных пар."""
+    import json
+
+    import torch
+    from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+    from src.cross_encoder import build_product_texts
+
+    config = json.loads((Path(DEFAULT_CE_DIR) / "inference_config.json").read_text())
+    max_length, mode = int(config["max_length"]), config["mode"]
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    tokenizer = AutoTokenizer.from_pretrained(DEFAULT_CE_DIR, local_files_only=True)
+    dtype = torch.float16 if device.type == "cuda" else torch.float32
+    model = AutoModelForSequenceClassification.from_pretrained(
+        DEFAULT_CE_DIR, local_files_only=True, dtype=dtype
+    ).to(device).eval()
+
+    texts = build_product_texts(items, mode)
+    left = matches["id1"].map(texts).fillna("").astype(str).to_numpy()
+    right = matches["id2"].map(texts).fillna("").astype(str).to_numpy()
+    del texts
+
+    scores = np.empty(len(matches), dtype=np.float32)
+    # Бакетинг по длине: батч дополняется до самой длинной строки в нём, поэтому
+    # соседство похожих длин заметно сокращает вычисления на паддинге.
+    order = np.argsort(np.fromiter(
+        (len(a) + len(b) for a, b in zip(left, right)), dtype=np.int32, count=len(left)
+    ))
+    with torch.inference_mode():
+        for start in range(0, len(order), DEFAULT_CE_BATCH):
+            rows = order[start:start + DEFAULT_CE_BATCH]
+            encoded = tokenizer(
+                left[rows].tolist(), right[rows].tolist(),
+                padding=True, truncation=True, max_length=max_length,
+                pad_to_multiple_of=8 if device.type == "cuda" else None,
+                return_tensors="pt",
+            ).to(device)
+            scores[rows] = model(**encoded).logits.squeeze(-1).float().cpu().numpy()
+    return scores
+
+
+def _blend_scores(matches: pd.DataFrame, items: pd.DataFrame, pairs: pd.DataFrame) -> np.ndarray:
+    """Смесь структурного бустинга и кросс-энкодера рангами внутри категории.
+
+    Модели ошибаются по-разному (корреляция рангов 0.58), поэтому смесь сильнее любой из
+    них. Вес свой на категорию: на обуви и одежде кросс-энкодер слаб и получает 0.1, на
+    продуктах питания он сильнее структурной модели и получает 0.8.
+    """
+    from src.features import extract_model_features
+    from src.model import BoostedPairModel
+
+    categories = pairs["category"].to_numpy().astype(str)
+    features = extract_model_features(matches, items)
+    primary = BoostedPairModel(DEFAULT_BOOST_MODEL_PATH).predict_probability(features, categories)
+    auxiliary = BoostedPairModel(DEFAULT_BOOST_AUX_MODEL_PATH).predict_probability(
+        features, categories
+    )
+    boost = (1.0 - DEFAULT_BOOST_AUX_WEIGHT) * primary + DEFAULT_BOOST_AUX_WEIGHT * auxiliary
+    del features, primary, auxiliary
+
+    ce = _cross_encoder_scores(matches, items)
+
+    artifact = np.load(DEFAULT_BLEND_WEIGHTS, allow_pickle=False)
+    weight_by_category = dict(zip(artifact["categories"].astype(str), artifact["weights"]))
+    fallback = float(artifact["global_weight"])
+
+    boost_rank = _category_ranks(boost, categories)
+    ce_rank = _category_ranks(ce, categories)
+    scores = np.empty(len(matches), dtype=np.float32)
+    for category in np.unique(categories):
+        mask = categories == category
+        weight = float(weight_by_category.get(category, fallback))
+        scores[mask] = weight * ce_rank[mask] + (1.0 - weight) * boost_rank[mask]
+    return scores
 
 
 def predict_scores(
@@ -31,7 +119,12 @@ def predict_scores(
     """Score input pairs while preserving their order."""
     if pairs is None:
         pairs = attach_texts(matches, items)
-    if method in {"supervised", "boosted"}:
+    if method == "blend":
+        scores = _blend_scores(matches, items, pairs)
+        # Ранги лежат в (0,1], поэтому 0.0 — корректное «хуже всех» для пар без текста.
+        missing = (pairs["text1"] == "").to_numpy() | (pairs["text2"] == "").to_numpy()
+        scores[missing] = 0.0
+    elif method in {"supervised", "boosted"}:
         from src.features import extract_model_features
         from src.model import BoostedPairModel, PairModel
 

@@ -27,3 +27,7 @@ examples/matching-baseline-submit/
 /output/
 submit*.csv
 matching-submit.zip
+
+# Веса кросс-энкодера: 127 MB, выше лимита GitHub в 100 MB на файл.
+# Воспроизводятся через src.train_ce_large (см. docs/KAGGLE.md).
+models/cross_encoder/*.safetensors

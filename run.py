@@ -10,7 +10,7 @@ import os
 
 from src.pipeline import predict_pipeline
 
-METHOD = os.environ.get("MATCH_METHOD", "boosted")
+METHOD = os.environ.get("MATCH_METHOD", "blend")
 
 
 def main() -> None:
