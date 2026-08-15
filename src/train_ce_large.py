@@ -88,6 +88,18 @@ def load_texts_for_ids(items_path: str, needed: set[int], mode: str) -> dict[int
     return texts
 
 
+def _fold_pair_files(pack: Path, fold: int) -> tuple[Path, Path]:
+    """Файлы пар для нужного фолда: ищутся рядом с пакетом и во всех входных каталогах."""
+    if fold == 0:
+        return pack / "llm_train.parquet", pack / "llm_valid.parquet"
+    roots = [pack, pack.parent, *pack.parent.parent.glob("*")] if pack.exists() else [pack]
+    for root in roots:
+        train = root / f"llm_train_f{fold}.parquet"
+        if train.exists():
+            return train, root / f"llm_valid_f{fold}.parquet"
+    raise SystemExit(f"Не найден llm_train_f{fold}.parquet рядом с {pack}")
+
+
 def encode_batch(tokenizer, left: list[str], right: list[str], max_length: int, on_cuda: bool):
     return tokenizer(
         left,
@@ -119,6 +131,10 @@ def fit_batch_size(
     size = requested
     while size >= 8:
         rows = longest[:size]
+        # Шаг делается ПОЛНОСТЬЮ, вместе с optimizer.step(): AdamW заводит два буфера
+        # размером с модель, и делает это только на первом реальном шаге. Проба без
+        # оптимизатора показывает, что батч влезает, а обучение затем падает.
+        probe = torch.optim.AdamW(model.parameters(), lr=1e-8)
         try:
             encoded = encode_batch(
                 tokenizer, [left[i] for i in rows], [right[i] for i in rows], max_length, True
@@ -126,14 +142,17 @@ def fit_batch_size(
             with torch.amp.autocast("cuda", dtype=amp_dtype):
                 loss = model(**encoded).logits.squeeze(-1).float().mean()
             loss.backward()
+            probe.step()
+            probe.zero_grad(set_to_none=True)
             model.zero_grad(set_to_none=True)
-            del encoded, loss
+            del encoded, loss, probe
             torch.cuda.empty_cache()
             if size != requested:
                 print(f"Батч уменьшен {requested} -> {size} по объёму видеопамяти", flush=True)
             return size
         except torch.OutOfMemoryError:
             model.zero_grad(set_to_none=True)
+            del probe
             torch.cuda.empty_cache()
             size //= 2
     raise SystemExit("Не помещается даже батч 8 — уменьшите --max-length")
@@ -196,14 +215,20 @@ def train_epochs(
     print(f"  [{stage}] заняло {(time.perf_counter() - t0) / 60:.1f} мин", flush=True)
 
 
-def predict_scores(model, tokenizer, left, right, device, batch_size, max_length) -> np.ndarray:
+def predict_scores(model, tokenizer, left, right, device, batch_size, max_length,
+                   amp_dtype=None) -> np.ndarray:
     import torch
 
+    if amp_dtype is None:
+        amp_dtype = torch.float16
     model.eval()
     scores = np.empty(len(left), dtype=np.float32)
     order = np.argsort([len(a) + len(b) for a, b in zip(left, right)])
     on_cuda = device.type == "cuda"
-    with torch.inference_mode():
+    # Без автокаста инференс идёт в fp32 и не задействует тензорные ядра: прошлый прогон
+    # выдал 104 пары/с там, где обучение с fp16 держало 115 — то есть скоринг был втрое
+    # дороже, чем нужно, и занимал больше времени, чем само обучение на ручных парах.
+    with torch.inference_mode(), torch.amp.autocast("cuda", dtype=amp_dtype, enabled=on_cuda):
         for start in range(0, len(order), batch_size):
             rows = order[start:start + batch_size]
             encoded = encode_batch(
@@ -226,7 +251,7 @@ def main() -> None:
     ap.add_argument("--prepacked", default=None,
                     help="каталог пакета от src.pack_kaggle вместо сырых assets")
     ap.add_argument("--mode", choices=["baseline", "compact", "name"], default="compact")
-    ap.add_argument("--max-length", type=int, default=192)
+    ap.add_argument("--max-length", type=int, default=256)
     ap.add_argument("--batch-size", type=int, default=256)
     ap.add_argument("--eval-batch-size", type=int, default=512)
     ap.add_argument("--epochs", type=int, default=1, help="эпохи предобучения на LLM")
@@ -239,7 +264,7 @@ def main() -> None:
     ap.add_argument("--valid-pairs", type=int, default=200_000)
     # Loss выходит на полку уже к трети эпохи: упор идёт в качество LLM-разметки, а не
     # в число примеров. Поэтому на более тяжёлой основе берём меньше пар, но не хуже.
-    ap.add_argument("--max-train-pairs", type=int, default=800_000)
+    ap.add_argument("--max-train-pairs", type=int, default=1_200_000)
     ap.add_argument("--holdout-fold", type=int, default=0)
     ap.add_argument("--n-folds", type=int, default=3)
     ap.add_argument("--checkpoint-every", type=int, default=2000)
@@ -267,12 +292,16 @@ def main() -> None:
         # Отбор пар и сборка текстов уже сделаны локально (src.pack_kaggle): на медленном
         # канале грузить 4.1 GB полного корпуса ради 6M нужных товаров бессмысленно.
         print(f"Готовый пакет: {pack}", flush=True)
-        train_pairs = pd.read_parquet(pack / "llm_train.parquet")
+        # Списки пар зависят от фолда, а тексты товаров — нет. Поэтому для фолдов 1 и 2
+        # достаточно маленьких файлов рядом, тяжёлые тексты переиспользуются.
+        train_file, valid_file = _fold_pair_files(pack, args.holdout_fold)
+        print(f"Пары: {train_file.name} / {valid_file.name}", flush=True)
+        train_pairs = pd.read_parquet(train_file)
         if args.max_train_pairs and args.max_train_pairs < len(train_pairs):
             train_pairs = train_pairs.sample(
                 n=args.max_train_pairs, random_state=args.seed
             ).reset_index(drop=True)
-        valid_pairs = pd.read_parquet(pack / "llm_valid.parquet")
+        valid_pairs = pd.read_parquet(valid_file)
         text_frame = pd.read_parquet(pack / "item_texts.parquet")
         texts = dict(zip(text_frame["id"].to_numpy().tolist(), text_frame["text"].tolist()))
         del text_frame
@@ -358,7 +387,7 @@ def main() -> None:
     eval_batch = min(args.eval_batch_size, batch_size * 2)
     before = predict_scores(
         model, tokenizer, [human_left[i] for i in human_valid_idx],
-        [human_right[i] for i in human_valid_idx], device, eval_batch, args.max_length,
+        [human_right[i] for i in human_valid_idx], device, eval_batch, args.max_length, amp_dtype,
     )
     macro_before, _ = macro_pr_auc(
         human_target[human_valid_idx].astype(np.int8), before, human_categories[human_valid_idx]
@@ -380,14 +409,14 @@ def main() -> None:
 
     print("\nОценка на LLM OOD-фолде...", flush=True)
     llm_scores = predict_scores(
-        model, tokenizer, valid_left, valid_right, device, eval_batch, args.max_length
+        model, tokenizer, valid_left, valid_right, device, eval_batch, args.max_length, amp_dtype
     )
     np.save(output / "llm_ood_scores.npy", llm_scores)
     valid_pairs[["id1", "id2", "label", "target"]].to_parquet(output / "llm_ood_pairs.parquet")
 
     print("\nСкоринг всех ручных пар (для расчёта смеси)...", flush=True)
     human_scores = predict_scores(
-        model, tokenizer, human_left, human_right, device, eval_batch, args.max_length
+        model, tokenizer, human_left, human_right, device, eval_batch, args.max_length, amp_dtype
     )
     np.save(output / "human_scores.npy", human_scores)
     np.save(output / "human_valid_idx.npy", human_valid_idx)

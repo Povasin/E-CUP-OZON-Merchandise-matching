@@ -69,6 +69,7 @@ def main() -> None:
     ap.add_argument("--max-iter", type=int, default=250)
     ap.add_argument("--seed", type=int, default=2026)
     ap.add_argument("--out", default="output/blend_weights_v13.npz")
+    ap.add_argument("--boost-cache", default="output/boost_holdout_v13.npy")
     args = ap.parse_args()
 
     features = np.load(args.features, mmap_mode="r")
@@ -94,10 +95,20 @@ def main() -> None:
     print(f"train={len(train_idx):,}, holdout={len(valid_idx):,}, "
           f"положительных в holdout {target[valid_idx].mean():.4f}\n", flush=True)
 
+    valid_categories = categories[valid_idx]
+    # Структурная модель между прогонами кросс-энкодера не меняется, поэтому её скоры на
+    # holdout считаются один раз. Дальше сравнение любой новой модели стоит секунды.
+    cache = Path(args.boost_cache)
+    if cache.exists():
+        boost = np.load(cache)
+        if len(boost) != len(valid_idx):
+            raise SystemExit(f"Кэш скоров не соответствует holdout: {len(boost)}")
+        print(f"Скоры структурной модели из кэша: {cache}", flush=True)
+        return report(boost, ce_all[valid_idx], target[valid_idx], valid_categories, args)
+
     print("Обучение структурной модели по категориям...", flush=True)
     boost = np.zeros(len(valid_idx), dtype=np.float32)
     train_categories = categories[train_idx]
-    valid_categories = categories[valid_idx]
     for category in sorted(np.unique(valid_categories)):
         rows = train_idx[train_categories == category]
         model = HistGradientBoostingClassifier(
@@ -112,8 +123,12 @@ def main() -> None:
         )[:, 1]
         print(f"  {category:<28} обучено на {len(rows):>7,}", flush=True)
 
-    y = target[valid_idx]
-    ce = ce_all[valid_idx]
+    np.save(args.boost_cache, boost)
+    print(f"Скоры структурной модели сохранены: {args.boost_cache}", flush=True)
+    return report(boost, ce_all[valid_idx], target[valid_idx], valid_categories, args)
+
+
+def report(boost, ce, y, valid_categories, args) -> None:
     boost_macro, boost_per = macro_pr_auc(y, boost, valid_categories)
     ce_macro, ce_per = macro_pr_auc(y, ce, valid_categories)
     print(f"\nСтруктурная модель  {boost_macro:.6f}")
@@ -162,7 +177,6 @@ def main() -> None:
     for category in sorted(boost_per, key=lambda c: boost_per[c]):
         print(f"  {category:<28} {boost_per[category]:.4f}  {ce_per[category]:.4f}  "
               f"{final[category]:.1f}")
-
 
 if __name__ == "__main__":
     main()
