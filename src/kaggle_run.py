@@ -30,7 +30,7 @@ PACK_FILES = ("llm_train.parquet", "llm_valid.parquet", "item_texts.parquet",
               "human_texts.parquet", "human_matches.parquet", "pack-info.json")
 # Модули, которые нужны train_ce_large; остальное в ноутбук не тянем.
 CODE_FILES = (
-    "__init__.py", "train_ce_large.py", "cross_encoder.py", "hybrid.py",
+    "__init__.py", "train_ce_large.py", "pseudo_label.py", "cross_encoder.py", "hybrid.py",
     "metrics.py", "features.py", "train_model.py", "model.py", "data.py", "scoring.py",
 )
 

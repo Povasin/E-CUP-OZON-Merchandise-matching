@@ -147,9 +147,12 @@ def fit_batch_size(
             model.zero_grad(set_to_none=True)
             del encoded, loss, probe
             torch.cuda.empty_cache()
-            if size != requested:
-                print(f"Батч уменьшен {requested} -> {size} по объёму видеопамяти", flush=True)
-            return size
+            # Половина от впритык поместившегося: проба ловит границу, но во время
+            # обучения аллокатор фрагментируется, и на границе прогон падает на
+            # произвольном шаге. Потеря скорости невелика, надёжность важнее.
+            safe = max(8, size // 2)
+            print(f"Батч: проба {size}, берём {safe} (запас на фрагментацию)", flush=True)
+            return safe
         except torch.OutOfMemoryError:
             model.zero_grad(set_to_none=True)
             del probe
@@ -158,10 +161,30 @@ def fit_batch_size(
     raise SystemExit("Не помещается даже батч 8 — уменьшите --max-length")
 
 
+def balanced_weights(labels: np.ndarray, categories: np.ndarray | None) -> np.ndarray:
+    """Равный вклад каждой пары «категория × класс».
+
+    Метрика усредняет 20 категорий с одинаковым весом, а данные приходят с перекосом:
+    в обуви и одежде положительных всего 4%, в бытовой химии — 43%. Модель видит
+    примеров совпадения для слабых категорий в восемь раз меньше и недоучивает именно
+    те категории, которые тянут макро-среднее вниз.
+    """
+    weights = np.ones(len(labels), dtype=np.float32)
+    if categories is None:
+        return weights
+    frame = pd.DataFrame({"cat": categories, "label": labels.astype(np.int8)})
+    counts = frame.groupby(["cat", "label"]).size()
+    target = len(labels) / len(counts)
+    for (category, label), count in counts.items():
+        weights[(categories == category) & (labels.astype(np.int8) == label)] = target / count
+    return weights / weights.mean()
+
+
 def train_epochs(
     model, tokenizer, left, right, labels, device, amp_dtype, scaler,
     epochs: int, batch_size: int, max_length: int, learning_rate: float,
     seed: int, checkpoint_every: int, checkpoint_dir: Path, stage: str,
+    sample_weights: np.ndarray | None = None,
 ) -> None:
     """Один этап обучения. Вызывается дважды: LLM-предобучение, затем ручные пары."""
     import torch
@@ -175,8 +198,11 @@ def train_epochs(
         optimizer, max_lr=learning_rate, total_steps=steps, pct_start=0.06,
         anneal_strategy="linear",
     )
-    loss_fn = torch.nn.BCEWithLogitsLoss()
+    loss_fn = torch.nn.BCEWithLogitsLoss(reduction="none")
     labels_t = torch.from_numpy(labels)
+    weights_t = torch.from_numpy(
+        sample_weights if sample_weights is not None else np.ones(len(labels), dtype=np.float32)
+    )
     rng = np.random.default_rng(seed)
 
     step = 0
@@ -193,7 +219,8 @@ def train_epochs(
             ).to(device)
             with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=on_cuda):
                 logits = model(**encoded).logits.squeeze(-1)
-                loss = loss_fn(logits.float(), labels_t[rows].to(device))
+                per_row = loss_fn(logits.float(), labels_t[rows].to(device))
+                loss = (per_row * weights_t[rows].to(device)).mean()
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -248,6 +275,14 @@ def main() -> None:
     # карточку в 219 токенов против 74 и рассыпает русские слова побуквенно.
     ap.add_argument("--base-model", default="DeepPavlov/rubert-base-cased")
     ap.add_argument("--output", default="output/ce_large")
+    ap.add_argument("--balance-categories", action="store_true",
+                    help="равный вклад каждой пары «категория × класс» в функцию потерь")
+    ap.add_argument("--resume-from", default=None,
+                    help="каталог модели после этапа 1; тогда предобучение пропускается")
+    ap.add_argument("--extra-pairs", default=None,
+                    help="parquet с псевдоразмеченными парами (id1,id2,label) в довесок")
+    ap.add_argument("--extra-texts", default=None,
+                    help="parquet с текстами для этих пар, если их нет в основном пакете")
     ap.add_argument("--prepacked", default=None,
                     help="каталог пакета от src.pack_kaggle вместо сырых assets")
     ap.add_argument("--mode", choices=["baseline", "compact", "name"], default="compact")
@@ -323,14 +358,32 @@ def main() -> None:
         return ([texts.get(int(i), "") for i in frame["id1"]],
                 [texts.get(int(i), "") for i in frame["id2"]])
 
+    if args.extra_pairs:
+        # Псевдоразмеченные спорные пары идут теми же данными, что и уверенные: их метки
+        # уже отфильтрованы по уверенности, поэтому отдельного веса не требуют.
+        extra = pd.read_parquet(args.extra_pairs)
+        if args.extra_texts:
+            frame = pd.read_parquet(args.extra_texts, columns=["id", "text"])
+            texts.update(zip(frame["id"].to_numpy().tolist(), frame["text"].tolist()))
+            del frame
+        before = len(train_pairs)
+        train_pairs = pd.concat(
+            [train_pairs[["id1", "id2", "label"]], extra[["id1", "id2", "label"]]],
+            ignore_index=True,
+        )
+        print(f"Добавлено псевдоразмеченных пар: {len(extra):,} "
+              f"({before:,} -> {len(train_pairs):,})", flush=True)
+        del extra
+
     train_left, train_right = sides(train_pairs)
     valid_left, valid_right = sides(valid_pairs)
     train_labels = train_pairs["label"].to_numpy(dtype=np.float32)
     del texts
 
     tokenizer = AutoTokenizer.from_pretrained(args.base_model)
+    source = args.resume_from or args.base_model
     model = AutoModelForSequenceClassification.from_pretrained(
-        args.base_model, num_labels=1
+        source, num_labels=1, local_files_only=bool(args.resume_from)
     ).to(device)
 
     # Масштабирование градиента нужно только fp16: у bf16 диапазон экспоненты как у fp32.
@@ -341,13 +394,16 @@ def main() -> None:
         args.batch_size, args.max_length,
     )
 
-    print("\nЭтап 1 — предобучение на LLM-разметке", flush=True)
-    train_epochs(
+    if args.resume_from:
+        print(f"\nЭтап 1 пропущен, модель взята из {args.resume_from}", flush=True)
+    else:
+        print("\nЭтап 1 — предобучение на LLM-разметке", flush=True)
+        train_epochs(
         model, tokenizer, train_left, train_right, train_labels, device, amp_dtype, scaler,
-        args.epochs, batch_size, args.max_length, args.learning_rate,
-        args.seed, args.checkpoint_every, output / "checkpoint", "llm",
-    )
-    model.save_pretrained(output / "stage1_llm")
+            args.epochs, batch_size, args.max_length, args.learning_rate,
+            args.seed, args.checkpoint_every, output / "checkpoint", "llm",
+        )
+        model.save_pretrained(output / "stage1_llm")
     del train_left, train_right, train_labels
 
     # Ручная разметка на два порядка меньше LLM, но точная. LLM служит предобучением,
@@ -400,6 +456,8 @@ def main() -> None:
         human_target[human_train_idx], device, amp_dtype, scaler,
         args.human_epochs, batch_size, args.max_length, args.human_learning_rate,
         args.seed, args.checkpoint_every, output / "checkpoint", "human",
+        balanced_weights(human_target[human_train_idx],
+                         human_categories[human_train_idx] if args.balance_categories else None),
     )
     model.save_pretrained(output)
     tokenizer.save_pretrained(output)
