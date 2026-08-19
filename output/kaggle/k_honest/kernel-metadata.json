@@ -1,0 +1,17 @@
+{
+  "id": "evgenymalkov/ecup-honest-noneigh",
+  "title": "ECUP honest no neigh",
+  "code_file": "ecup-honest-noneigh.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_internet": true,
+  "dataset_sources": [
+    "evgenymalkov/ecup-features-v2"
+  ],
+  "kernel_sources": [
+    "evgenymalkov/ecup-all-features"
+  ],
+  "competition_sources": []
+}

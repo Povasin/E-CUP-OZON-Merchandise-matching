@@ -1,0 +1,22 @@
+{
+ "id": "evgenymalkov/ecup-final4x",
+ "title": "ECUP final4x",
+ "code_file": "ecup-final4x.ipynb",
+ "language": "python",
+ "kernel_type": "notebook",
+ "is_private": true,
+ "enable_gpu": false,
+ "enable_internet": false,
+ "dataset_sources": [
+  "evgenymalkov/ecup-llm-valid",
+  "evgenymalkov/ecup-code",
+  "evgenymalkov/ecup-fuse-scores-v2",
+  "evgenymalkov/ecup-structural",
+  "evgenymalkov/ecup-bi-scores"
+ ],
+ "kernel_sources": [
+  "evgenymalkov/ecup-ce-hardneg",
+  "evgenymalkov/ecup-score-four"
+ ],
+ "competition_sources": []
+}

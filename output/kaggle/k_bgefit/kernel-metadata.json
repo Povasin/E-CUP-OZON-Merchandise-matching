@@ -1,0 +1,21 @@
+{
+ "id": "elina2810/ecup-bgefit",
+ "title": "ECUP bgefit",
+ "code_file": "ecup-bgefit.ipynb",
+ "language": "python",
+ "kernel_type": "notebook",
+ "is_private": true,
+ "enable_gpu": false,
+ "enable_internet": false,
+ "dataset_sources": [
+  "elina2810/ecup-llm-valid",
+  "elina2810/ecup-code",
+  "elina2810/ecup-fuse-scores-v2",
+  "elina2810/ecup-structural",
+  "elina2810/ecup-hardneg-scores"
+ ],
+ "kernel_sources": [
+  "elina2810/ecup-ce-bge"
+ ],
+ "competition_sources": []
+}

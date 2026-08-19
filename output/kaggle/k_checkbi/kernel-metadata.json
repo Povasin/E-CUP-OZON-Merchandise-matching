@@ -1,0 +1,20 @@
+{
+ "id": "evgenymalkov/ecup-check-bi",
+ "title": "ECUP check bi",
+ "code_file": "ecup-check-bi.ipynb",
+ "language": "python",
+ "kernel_type": "notebook",
+ "is_private": true,
+ "enable_gpu": true,
+ "enable_internet": false,
+ "dataset_sources": [
+  "evgenymalkov/ecup-llm-valid",
+  "evgenymalkov/ecup-code",
+  "evgenymalkov/ecup-bi-scores"
+ ],
+ "kernel_sources": [
+  "evgenymalkov/ecup-biencoder"
+ ],
+ "competition_sources": [],
+ "accelerator": "nvidiaTeslaT4"
+}

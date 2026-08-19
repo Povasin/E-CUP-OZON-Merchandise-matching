@@ -1,0 +1,17 @@
+{
+ "id": "evgenymalkov/ecup-timing",
+ "title": "ECUP timing",
+ "code_file": "ecup-timing.ipynb",
+ "language": "python",
+ "kernel_type": "notebook",
+ "is_private": true,
+ "enable_gpu": false,
+ "enable_internet": false,
+ "dataset_sources": [
+  "evgenymalkov/ecup-llm-valid",
+  "evgenymalkov/ecup-code",
+  "evgenymalkov/ecup-structural"
+ ],
+ "kernel_sources": [],
+ "competition_sources": []
+}

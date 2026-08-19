@@ -1,0 +1,18 @@
+{
+  "id": "martie69997c/relax-a",
+  "title": "relax-a",
+  "code_file": "relax-a.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "machine_shape": "NvidiaTeslaT4",
+  "enable_internet": true,
+  "dataset_sources": [
+    "martie69997c/ecup-matching-data",
+    "martie69997c/ecup-matching-src",
+    "martie69997c/ecup-stage1"
+  ],
+  "kernel_sources": [],
+  "competition_sources": []
+}

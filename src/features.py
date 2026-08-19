@@ -527,8 +527,11 @@ def _extra_features(
     only = (left_names - right_names) | (right_names - left_names)
     max_shared = max((name_idf.get(t, 1.0) for t in shared), default=0.0) / name_max_idf
     max_unshared = max((name_idf.get(t, 1.0) for t in only), default=0.0) / name_max_idf
-    rarest_left = max(left_names, key=lambda t: name_idf.get(t, 1.0)) if left_names else None
-    rarest_right = max(right_names, key=lambda t: name_idf.get(t, 1.0)) if right_names else None
+    # Ничьи разрешаются самим словом: без этого max() берёт первый элемент в порядке
+    # перебора множества, а он зависит от хеш-соли процесса. Признак получался разным
+    # при обучении и в production просто потому, что это разные запуски Python.
+    rarest_left = max(left_names, key=lambda t: (name_idf.get(t, 1.0), t)) if left_names else None
+    rarest_right = max(right_names, key=lambda t: (name_idf.get(t, 1.0), t)) if right_names else None
     rarest_shared = float(
         rarest_left is not None and rarest_left in right_names
         and rarest_right is not None and rarest_right in left_names
@@ -945,12 +948,93 @@ def extract_v13_pair_features(matches: pd.DataFrame, items: pd.DataFrame) -> np.
     return result
 
 
+def _document_frequency(items: pd.DataFrame) -> tuple[dict[str, int], dict[str, int], int]:
+    """Счётчики документной частоты по куску карточек; складываются между кусками."""
+    name_df: dict[str, int] = {}
+    attr_df: dict[str, int] = {}
+    total = 0
+    for view in build_product_views(items).values():
+        total += 1
+        for token in view.name_tokens:
+            name_df[token] = name_df.get(token, 0) + 1
+        for token in view.value_tokens:
+            attr_df[token] = attr_df.get(token, 0) + 1
+    return name_df, attr_df, total
+
+
+def _features_for_chunk(payload: tuple) -> np.ndarray:
+    matches, items, name_idf, name_max_idf, attr_idf = payload
+    views = build_product_views(items)
+    result = np.empty((len(matches), len(FEATURE_NAMES)), dtype=np.float32)
+    for row, (id1, id2) in enumerate(matches[["id1", "id2"]].itertuples(index=False, name=None)):
+        left = views.get(int(id1), EMPTY_VIEW)
+        right = views.get(int(id2), EMPTY_VIEW)
+        result[row] = _pair_features(left, right) + _extra_features(
+            left, right, name_idf, name_max_idf, attr_idf
+        )
+    return result
+
+
+def extract_pair_features_parallel(
+    matches: pd.DataFrame, items: pd.DataFrame, workers: int | None = None
+) -> np.ndarray:
+    """То же, что extract_pair_features, но на всех ядрах.
+
+    Разбор карточек занимает 72% времени извлечения признаков — около 300 секунд на
+    Private при лимите 780, и всё это в один поток при двадцати доступных ядрах.
+
+    Прямое разбиение по парам даёт неверный результат: шесть признаков опираются на
+    IDF, то есть на редкость слова во ВСЁМ корпусе прогона, а каждый работник считал бы
+    её по своему куску. Поэтому проход двойной: сначала параллельно собираются счётчики
+    частот и складываются в общий словарь, затем с ним считаются признаки. Карточки
+    разбираются дважды, но обе фазы параллельны, так что выигрыш сохраняется.
+    """
+    import math
+    import os
+    from concurrent.futures import ProcessPoolExecutor
+
+    workers = workers or min(os.cpu_count() or 1, 20)
+    if workers <= 1 or len(matches) < 20_000:
+        return extract_pair_features(matches, items)
+
+    item_chunks = [items.iloc[idx].reset_index(drop=True)
+                   for idx in np.array_split(np.arange(len(items)), workers)]
+    name_df: dict[str, int] = {}
+    attr_df: dict[str, int] = {}
+    total = 0
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        for chunk_name, chunk_attr, chunk_total in pool.map(_document_frequency, item_chunks):
+            total += chunk_total
+            for token, count in chunk_name.items():
+                name_df[token] = name_df.get(token, 0) + count
+            for token, count in chunk_attr.items():
+                attr_df[token] = attr_df.get(token, 0) + count
+    name_idf = {t: math.log((total + 1) / (c + 1)) + 1.0 for t, c in name_df.items()}
+    attr_idf = {t: math.log((total + 1) / (c + 1)) + 1.0 for t, c in attr_df.items()}
+    name_max_idf = math.log(total + 1) + 1.0
+    del name_df, attr_df
+
+    row_by_id = {int(item_id): row for row, item_id in enumerate(items["id"].to_numpy())}
+    left_ids = matches["id1"].to_numpy()
+    right_ids = matches["id2"].to_numpy()
+    payloads = []
+    for index in np.array_split(np.arange(len(matches)), workers * 2):
+        rows = {row_by_id[int(i)] for i in left_ids[index] if int(i) in row_by_id}
+        rows.update(row_by_id[int(i)] for i in right_ids[index] if int(i) in row_by_id)
+        payloads.append((matches.iloc[index].reset_index(drop=True),
+                         items.iloc[sorted(rows)].reset_index(drop=True),
+                         name_idf, name_max_idf, attr_idf))
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        parts = list(pool.map(_features_for_chunk, payloads))
+    return np.vstack(parts)
+
+
 def extract_model_features(matches: pd.DataFrame, items: pd.DataFrame) -> np.ndarray:
     """Structured features plus two unsupervised lexical cosine signals."""
     from src.data import attach_texts, build_item_text
     from src.scoring import tfidf_scores
 
-    structured = extract_pair_features(matches, items)
+    structured = extract_pair_features_parallel(matches, items)
 
     text_items = items[["id", "category"]].copy()
     text_items["text"] = build_item_text(items)

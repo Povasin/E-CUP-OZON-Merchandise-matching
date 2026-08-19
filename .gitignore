@@ -31,3 +31,15 @@ matching-submit.zip
 # Веса кросс-энкодера: 127 MB, выше лимита GitHub в 100 MB на файл.
 # Воспроизводятся через src.train_ce_large (см. docs/KAGGLE.md).
 models/cross_encoder/*.safetensors
+
+# Веса энкодеров: по 0.3-0.7 ГБ на модель, выше лимита GitHub в 100 МБ на файл.
+# Обучаются на Kaggle тетрадями из output/kaggle, состав задаёт models/fusion_info.json.
+/models/ce_*/
+/models/fp16/
+
+# Промежуточные артефакты вытесненного подхода со сложением рангов: заменены слитой
+# моделью (models/fusion_boost.npz), воспроизводятся через src.blend_many.
+/models/blend_full.npz
+/models/blend_llmfold.npz
+/models/blend_noneigh.npz
+/models/blend_specself.npz

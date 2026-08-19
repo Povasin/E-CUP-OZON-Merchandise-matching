@@ -1,0 +1,21 @@
+{
+ "id": "evgenymalkov/ecup-canon",
+ "title": "ECUP canon",
+ "code_file": "ecup-canon.ipynb",
+ "language": "python",
+ "kernel_type": "notebook",
+ "is_private": true,
+ "enable_gpu": false,
+ "enable_internet": false,
+ "dataset_sources": [
+  "evgenymalkov/ecup-llm-valid",
+  "evgenymalkov/ecup-code",
+  "evgenymalkov/ecup-fuse-scores",
+  "evgenymalkov/ecup-structural",
+  "evgenymalkov/ecup-bi-scores"
+ ],
+ "kernel_sources": [
+  "evgenymalkov/ecup-ce-hardneg"
+ ],
+ "competition_sources": []
+}

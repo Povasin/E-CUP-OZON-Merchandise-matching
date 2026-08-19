@@ -1,0 +1,19 @@
+{
+  "id": "martie69997c/evalscore",
+  "title": "evalscore",
+  "code_file": "evalscore.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "machine_shape": "NvidiaTeslaT4",
+  "enable_internet": true,
+  "dataset_sources": [
+    "martie69997c/ecup-eval-retrieval",
+    "martie69997c/ecup-matching-data"
+  ],
+  "kernel_sources": [
+    "martie69997c/relax-b"
+  ],
+  "competition_sources": []
+}

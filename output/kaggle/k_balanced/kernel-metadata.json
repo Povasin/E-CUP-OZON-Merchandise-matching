@@ -1,0 +1,18 @@
+{
+  "id": "gnkitty/ecup-ce-balanced",
+  "title": "ECUP ce balanced",
+  "code_file": "ecup-ce-balanced.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "dataset_sources": [
+    "gnkitty/ecup-matching-data",
+    "gnkitty/ecup-matching-src"
+  ],
+  "kernel_sources": [
+    "gnkitty/ecup-cross-encoder-large"
+  ],
+  "competition_sources": []
+}

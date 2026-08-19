@@ -1,0 +1,17 @@
+{
+  "id": "evgenymalkov/ecup-features-full",
+  "title": "ECUP features full",
+  "code_file": "ecup-features-full.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_internet": true,
+  "dataset_sources": [
+    "evgenymalkov/ecup-features"
+  ],
+  "kernel_sources": [
+    "evgenymalkov/ecup-features-run"
+  ],
+  "competition_sources": []
+}

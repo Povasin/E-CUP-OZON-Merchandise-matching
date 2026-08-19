@@ -184,7 +184,7 @@ def train_epochs(
     model, tokenizer, left, right, labels, device, amp_dtype, scaler,
     epochs: int, batch_size: int, max_length: int, learning_rate: float,
     seed: int, checkpoint_every: int, checkpoint_dir: Path, stage: str,
-    sample_weights: np.ndarray | None = None,
+    sample_weights: np.ndarray | None = None, rank_weight: float = 0.0,
 ) -> None:
     """Один этап обучения. Вызывается дважды: LLM-предобучение, затем ручные пары."""
     import torch
@@ -199,6 +199,19 @@ def train_epochs(
         anneal_strategy="linear",
     )
     loss_fn = torch.nn.BCEWithLogitsLoss(reduction="none")
+
+    def ranking_term(logits: "torch.Tensor", labels: "torch.Tensor") -> "torch.Tensor":
+        """Попарная ранжирующая потеря: положительный должен стоять выше отрицательного.
+
+        BCE оптимизирует калибровку — насколько предсказанная вероятность близка к
+        истине. Метрика соревнования калибровку игнорирует и оценивает только порядок.
+        Этот член штрафует именно за неверный порядок и потому целится в метрику прямо.
+        """
+        pos = logits[labels > 0.5]
+        neg = logits[labels <= 0.5]
+        if not len(pos) or not len(neg):
+            return logits.sum() * 0.0
+        return torch.nn.functional.softplus(neg.unsqueeze(0) - pos.unsqueeze(1)).mean()
     labels_t = torch.from_numpy(labels)
     weights_t = torch.from_numpy(
         sample_weights if sample_weights is not None else np.ones(len(labels), dtype=np.float32)
@@ -219,8 +232,11 @@ def train_epochs(
             ).to(device)
             with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=on_cuda):
                 logits = model(**encoded).logits.squeeze(-1)
-                per_row = loss_fn(logits.float(), labels_t[rows].to(device))
+                target_batch = labels_t[rows].to(device)
+                per_row = loss_fn(logits.float(), target_batch)
                 loss = (per_row * weights_t[rows].to(device)).mean()
+                if rank_weight:
+                    loss = loss + rank_weight * ranking_term(logits.float(), target_batch)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -275,12 +291,29 @@ def main() -> None:
     # карточку в 219 токенов против 74 и рассыпает русские слова побуквенно.
     ap.add_argument("--base-model", default="DeepPavlov/rubert-base-cased")
     ap.add_argument("--output", default="output/ce_large")
+    ap.add_argument("--only-categories", default=None,
+                    help="дообучать только на этих категориях через запятую: модель-специалист "
+                         "для категорий, где название товара неинформативно")
+    ap.add_argument("--joint", type=float, default=0.0,
+                    help="совместное обучение вместо двух этапов: доля веса ручных пар "
+                         "в общем градиенте (например 0.5). LLM-пары идут в тот же проход, "
+                         "поэтому не забываются")
+    ap.add_argument("--rank-loss", type=float, default=0.0,
+                    help="вес ранжирующего члена в функции потерь на этапе 2")
+    ap.add_argument("--human-all", action="store_true",
+                    help="production: учить на ВСЕХ ручных парах, включая holdout. "
+                         "Метрика после этого недостоверна — модель видела всё")
+    ap.add_argument("--human-relaxed", action="store_true",
+                    help="учить на всех ручных парах кроме holdout, а не только на строго "
+                         "непересекающихся: удваивает объём ценой утечки на уровне товаров")
     ap.add_argument("--balance-categories", action="store_true",
                     help="равный вклад каждой пары «категория × класс» в функцию потерь")
     ap.add_argument("--resume-from", default=None,
                     help="каталог модели после этапа 1; тогда предобучение пропускается")
     ap.add_argument("--extra-pairs", default=None,
                     help="parquet с псевдоразмеченными парами (id1,id2,label) в довесок")
+    ap.add_argument("--hard-negatives", default=None,
+                    help="parquet с трудными негативами (id1,id2) к ручной разметке")
     ap.add_argument("--extra-texts", default=None,
                     help="parquet с текстами для этих пар, если их нет в основном пакете")
     ap.add_argument("--prepacked", default=None,
@@ -396,15 +429,25 @@ def main() -> None:
 
     if args.resume_from:
         print(f"\nЭтап 1 пропущен, модель взята из {args.resume_from}", flush=True)
+    elif args.joint:
+        # Совместное обучение заменяет оба этапа: предобучать отдельно незачем.
+        print("\nЭтап 1 пропущен: обучение совместное", flush=True)
+    elif args.epochs <= 0:
+        # Качество на ручном holdout и на LLM-фолде связаны обратно (Спирмен −0.95): чем
+        # ближе модель к ручной разметке, тем дальше от LLM. Отсюда вопрос, не вредит ли
+        # LLM-предобучение вовсе; `--epochs 0` учит с голой основы, чтобы это проверить.
+        print("\nЭтап 1 отключён: обучение только на ручной разметке", flush=True)
     else:
         print("\nЭтап 1 — предобучение на LLM-разметке", flush=True)
         train_epochs(
-        model, tokenizer, train_left, train_right, train_labels, device, amp_dtype, scaler,
+            model, tokenizer, train_left, train_right, train_labels, device, amp_dtype, scaler,
             args.epochs, batch_size, args.max_length, args.learning_rate,
             args.seed, args.checkpoint_every, output / "checkpoint", "llm",
         )
         model.save_pretrained(output / "stage1_llm")
-    del train_left, train_right, train_labels
+    if not args.joint:
+        # При совместном обучении LLM-пары нужны дальше, удалять их нельзя.
+        del train_left, train_right, train_labels
 
     # Ручная разметка на два порядка меньше LLM, но точная. LLM служит предобучением,
     # ручные пары — финальной настройкой; иначе лучший сигнал остаётся неиспользованным.
@@ -422,6 +465,23 @@ def main() -> None:
         human_matches = pd.read_parquet(args.human_matches, columns=["id1", "id2", "target"])
         human_texts = build_product_texts(human_items, args.mode)
         category_by_id = dict(zip(human_items["id"], human_items["category"].astype(str)))
+    if args.hard_negatives:
+        # В закрытом тесте негативы получены ретривалом — берут товар и подтягивают
+        # похожие, поэтому пары трудные. В ручной разметке негативы собраны иначе и легче,
+        # отсюда и расхождение локальной метрики с лидербордом. Здесь трудные негативы
+        # добавляются в обучение, чтобы модель увидела то, на чём её будут проверять.
+        hard = pd.read_parquet(args.hard_negatives)
+        hard = hard.assign(target=np.zeros(len(hard), dtype=human_matches["target"].dtype))
+        before = len(human_matches)
+        human_matches = pd.concat(
+            [human_matches[["id1", "id2", "target"]], hard[["id1", "id2", "target"]]],
+            ignore_index=True,
+        )
+        print(f"Трудных негативов добавлено: {len(hard):,} "
+              f"({before:,} -> {len(human_matches):,}, "
+              f"доля положительных {human_matches['target'].mean():.3f})", flush=True)
+        del hard
+
     human_left = [human_texts.get(int(i), "") for i in human_matches["id1"]]
     human_right = [human_texts.get(int(i), "") for i in human_matches["id2"]]
     human_target = human_matches["target"].to_numpy(dtype=np.float32)
@@ -433,10 +493,57 @@ def main() -> None:
         human_matches["id1"].to_numpy(), human_matches["id2"].to_numpy(),
         args.holdout_fold, args.n_folds,
     )
-    human_train_idx = np.flatnonzero(human_train_mask)
     human_valid_idx = np.flatnonzero(human_valid_mask)
+    if args.human_all:
+        # Holdout нужен только для замера. Для production он не нужен, а ручная разметка —
+        # единственный источник, который в наших опытах давал реальный прирост.
+        human_train_idx = np.arange(len(human_matches))
+        print("PRODUCTION: обучение на ВСЕХ ручных парах, метрика ниже недостоверна",
+              flush=True)
+    elif args.human_relaxed:
+        # Строгое условие отбрасывает пары, где лишь ОДИН товар принадлежит holdout-фолду,
+        # — а это 44% ручной разметки. Сами пары в holdout не входят, поэтому обучаться на
+        # них можно; ослабляется лишь гарантия: модель увидит часть товаров holdout в
+        # других парах. Пары остаются невиденными, и это главное.
+        human_train_idx = np.flatnonzero(~human_valid_mask)
+    else:
+        human_train_idx = np.flatnonzero(human_train_mask)
+    if args.only_categories:
+        # Метрика усредняет категории поровну, а общая модель оптимизирует средний случай,
+        # где название товара информативно. Там, где оно пустое («кроссовки geox»), нужна
+        # другая стратегия — опора на сочетания атрибутов, и ей надо учиться отдельно.
+        wanted = {c.strip() for c in args.only_categories.split(",")}
+        keep = np.isin(human_categories[human_train_idx], list(wanted))
+        human_train_idx = human_train_idx[keep]
+        print(f"Дообучение только на категориях: {', '.join(sorted(wanted))}", flush=True)
+
     print(f"\nЭтап 2 — дообучение на ручной разметке: "
           f"train={len(human_train_idx):,}, holdout={len(human_valid_idx):,}", flush=True)
+
+    if args.joint:
+        # Последовательные этапы обесценивают LLM-данные: дообучение на 162k ручных пар
+        # стирает знания, полученные на миллионе LLM-пар. Измерено: модель с ЛУЧШИМ
+        # первым этапом (0.6997 против 0.6636) закончила ХУЖЕ. Совместное обучение
+        # держит оба источника в одном проходе, поэтому забывать нечего.
+        joint_left = train_left + [human_left[i] for i in human_train_idx]
+        joint_right = train_right + [human_right[i] for i in human_train_idx]
+        joint_labels = np.concatenate([train_labels, human_target[human_train_idx]])
+        n_llm, n_human = len(train_labels), len(human_train_idx)
+        # Вес подбирается так, чтобы ручные пары дали заданную долю суммарного градиента.
+        w_human = args.joint / (1.0 - args.joint) * n_llm / n_human
+        joint_weights = np.concatenate([
+            np.ones(n_llm, dtype=np.float32),
+            np.full(n_human, w_human, dtype=np.float32)]).astype(np.float32)
+        joint_weights /= joint_weights.mean()
+        print(f"\nСовместное обучение: {n_llm:,} LLM + {n_human:,} ручных, "
+              f"вес ручной пары {w_human:.1f} (доля градиента {args.joint:.0%})", flush=True)
+        train_epochs(
+            model, tokenizer, joint_left, joint_right, joint_labels, device, amp_dtype, scaler,
+            args.human_epochs, batch_size, args.max_length, args.human_learning_rate,
+            args.seed, args.checkpoint_every, output / "checkpoint", "joint",
+            sample_weights=joint_weights, rank_weight=args.rank_loss,
+        )
+        del joint_left, joint_right
 
     print("Метрика ДО дообучения (только LLM-предобучение):", flush=True)
     # Инференс держит меньше, чем обучение, но запас берём от найденного батча.
@@ -450,15 +557,18 @@ def main() -> None:
     )
     print(f"  macro PR-AUC = {macro_before:.6f}", flush=True)
 
-    train_epochs(
-        model, tokenizer,
-        [human_left[i] for i in human_train_idx], [human_right[i] for i in human_train_idx],
-        human_target[human_train_idx], device, amp_dtype, scaler,
-        args.human_epochs, batch_size, args.max_length, args.human_learning_rate,
-        args.seed, args.checkpoint_every, output / "checkpoint", "human",
-        balanced_weights(human_target[human_train_idx],
-                         human_categories[human_train_idx] if args.balance_categories else None),
-    )
+    if not args.joint:
+        train_epochs(
+            model, tokenizer,
+            [human_left[i] for i in human_train_idx], [human_right[i] for i in human_train_idx],
+            human_target[human_train_idx], device, amp_dtype, scaler,
+            args.human_epochs, batch_size, args.max_length, args.human_learning_rate,
+            args.seed, args.checkpoint_every, output / "checkpoint", "human",
+            rank_weight=args.rank_loss,
+            sample_weights=balanced_weights(
+                human_target[human_train_idx],
+                human_categories[human_train_idx] if args.balance_categories else None),
+        )
     model.save_pretrained(output)
     tokenizer.save_pretrained(output)
     (output / "inference_config.json").write_text(

@@ -1,0 +1,17 @@
+{
+ "id": "elina2810/ecup-ce-dity",
+ "title": "ECUP ce dity",
+ "code_file": "ecup-ce-dity.ipynb",
+ "language": "python",
+ "kernel_type": "notebook",
+ "is_private": true,
+ "enable_gpu": true,
+ "enable_internet": true,
+ "dataset_sources": [
+  "elina2810/ecup-matching-pack",
+  "elina2810/ecup-code",
+  "elina2810/ecup-hard"
+ ],
+ "kernel_sources": [],
+ "competition_sources": []
+}

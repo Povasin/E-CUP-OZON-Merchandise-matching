@@ -1,0 +1,22 @@
+{
+ "id": "evgenymalkov/ecup-score-four",
+ "title": "ECUP score four",
+ "code_file": "ecup-score-four.ipynb",
+ "language": "python",
+ "kernel_type": "notebook",
+ "is_private": true,
+ "enable_gpu": true,
+ "enable_internet": false,
+ "dataset_sources": [
+  "evgenymalkov/ecup-matching-pack",
+  "evgenymalkov/ecup-llm-2m",
+  "evgenymalkov/ecup-code",
+  "evgenymalkov/ecup-encoders",
+  "evgenymalkov/ecup-encoders-fp16"
+ ],
+ "kernel_sources": [
+  "evgenymalkov/ecup-ce-hardneg",
+  "evgenymalkov/ecup-biencoder"
+ ],
+ "competition_sources": []
+}

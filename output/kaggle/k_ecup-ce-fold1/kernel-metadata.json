@@ -1,0 +1,16 @@
+{
+  "id": "gnkitty/ecup-ce-fold1",
+  "title": "ECUP ce fold1",
+  "code_file": "ecup-ce-fold1.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "dataset_sources": [
+    "gnkitty/ecup-matching-data",
+    "gnkitty/ecup-matching-src"
+  ],
+  "competition_sources": [],
+  "kernel_sources": []
+}

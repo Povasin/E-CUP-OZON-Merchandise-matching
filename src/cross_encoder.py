@@ -8,6 +8,7 @@ and transfers only one score per pair back to CPU.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -63,26 +64,50 @@ def compact_product_text(name: object, category: object, raw_attributes: object)
         normalized = key.lower().replace("ё", "е")
         if any(term in normalized for term in SKIP_ATTRIBUTE_TERMS):
             continue
+        # Берём ВСЁ, кроме заведомо бесполезного, а приоритет лишь задаёт порядок.
+        # Прежний отбор по белому списку молча выбрасывал 24% атрибутов — среди них
+        # «оем номер» кириллицей (шаблон был написан латиницей) и все списки
+        # совместимости: 14 496 значений и 5.7 млн символов, в основном в электронике
+        # и автотоварах, где совместимость товар практически и определяет.
         priority = next(
             (row for row, terms in enumerate(ATTRIBUTE_PRIORITIES)
              if any(term in normalized for term in terms)),
-            None,
+            len(ATTRIBUTE_PRIORITIES),
         )
-        if priority is not None:
-            selected.append((priority, key, value))
+        selected.append((priority, key, value))
     selected.sort(key=lambda item: (item[0], item[1]))
     fields = [f"Название: {name}", f"Категория: {category}"]
     fields.extend(f"{key}: {value}" for _, key, value in selected)
     return " | ".join(fields)
 
 
-def build_product_texts(items: pd.DataFrame, mode: str = "baseline") -> dict[int, str]:
+def _text_chunk(rows: list[tuple], mode: str) -> dict[int, str]:
+    builder = {"baseline": baseline_product_text, "compact": compact_product_text}.get(mode)
+    if builder is None:
+        return {int(i): str(n) for i, n, _, _ in rows}
+    return {int(i): builder(n, c, a) for i, n, a, c in rows}
+
+
+def build_product_texts(items: pd.DataFrame, mode: str = "baseline",
+                        workers: int | None = None) -> dict[int, str]:
+    """Тексты карточек. Разбор атрибутов раскладывается по ядрам: последовательным циклом
+    он стоил 69 секунд на объёме теста, а на проверке двадцать ядер."""
     if mode not in {"baseline", "compact", "name"}:
         raise ValueError("CE text mode must be baseline, compact or name")
+    rows = list(items[["id", "name", "attributes", "category"]].itertuples(index=False, name=None))
+    workers = workers or min(os.cpu_count() or 1, 20)
+    if workers > 1 and len(rows) > 20_000:
+        from concurrent.futures import ProcessPoolExecutor
+
+        size = (len(rows) + workers - 1) // workers
+        chunks = [rows[start:start + size] for start in range(0, len(rows), size)]
+        merged: dict[int, str] = {}
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            for part in pool.map(_text_chunk, chunks, [mode] * len(chunks)):
+                merged.update(part)
+        return merged
     result: dict[int, str] = {}
-    for item_id, name, attrs, category in items[
-        ["id", "name", "attributes", "category"]
-    ].itertuples(index=False, name=None):
+    for item_id, name, attrs, category in rows:
         if mode == "baseline":
             text = baseline_product_text(name, category, attrs)
         elif mode == "compact":

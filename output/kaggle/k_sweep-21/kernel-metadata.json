@@ -1,0 +1,18 @@
+{
+  "id": "darkdustrydarkness/sweep-21",
+  "title": "sweep 21",
+  "code_file": "sweep-21.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "machine_shape": "NvidiaTeslaT4",
+  "enable_internet": true,
+  "dataset_sources": [
+    "darkdustrydarkness/ecup-pack-dd",
+    "darkdustrydarkness/ecup-code-dd",
+    "darkdustrydarkness/ecup-stage1"
+  ],
+  "kernel_sources": [],
+  "competition_sources": []
+}

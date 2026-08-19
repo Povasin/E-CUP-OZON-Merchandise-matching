@@ -1,0 +1,21 @@
+{
+ "id": "evgenymalkov/ecup-fusion-final2",
+ "title": "ECUP fusion final2",
+ "code_file": "ecup-fusion-final2.ipynb",
+ "language": "python",
+ "kernel_type": "notebook",
+ "is_private": true,
+ "enable_gpu": false,
+ "enable_internet": false,
+ "dataset_sources": [
+  "evgenymalkov/ecup-llm-valid",
+  "evgenymalkov/ecup-code",
+  "evgenymalkov/ecup-fuse-scores-v2",
+  "evgenymalkov/ecup-structural"
+ ],
+ "kernel_sources": [
+  "evgenymalkov/ecup-score-clean",
+  "evgenymalkov/ecup-score-two"
+ ],
+ "competition_sources": []
+}

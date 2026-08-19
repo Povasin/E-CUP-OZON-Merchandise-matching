@@ -1,0 +1,18 @@
+{
+  "id": "semenmaskviten/ecup-ce-spec",
+  "title": "ECUP ce spec",
+  "code_file": "ecup-ce-spec.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "dataset_sources": [
+    "semenmaskviten/ecup-matching-data",
+    "semenmaskviten/ecup-matching-src"
+  ],
+  "kernel_sources": [
+    "semenmaskviten/ecup-ce-relaxed"
+  ],
+  "competition_sources": []
+}

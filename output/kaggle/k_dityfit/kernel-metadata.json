@@ -1,0 +1,21 @@
+{
+ "id": "evgenymalkov/ecup-dityfit",
+ "title": "ECUP dityfit",
+ "code_file": "ecup-dityfit.ipynb",
+ "language": "python",
+ "kernel_type": "notebook",
+ "is_private": true,
+ "enable_gpu": false,
+ "enable_internet": false,
+ "dataset_sources": [
+  "evgenymalkov/ecup-llm-valid",
+  "evgenymalkov/ecup-code",
+  "evgenymalkov/ecup-fuse-scores-v2",
+  "evgenymalkov/ecup-structural",
+  "evgenymalkov/ecup-dity-scores"
+ ],
+ "kernel_sources": [
+  "evgenymalkov/ecup-ce-hardneg"
+ ],
+ "competition_sources": []
+}

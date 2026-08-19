@@ -1,0 +1,22 @@
+{
+ "id": "elina2810/ecup-newenc",
+ "title": "ECUP newenc",
+ "code_file": "ecup-newenc.ipynb",
+ "language": "python",
+ "kernel_type": "notebook",
+ "is_private": true,
+ "enable_gpu": false,
+ "enable_internet": false,
+ "dataset_sources": [
+  "elina2810/ecup-llm-valid",
+  "elina2810/ecup-code",
+  "elina2810/ecup-fuse-scores-v2",
+  "elina2810/ecup-structural",
+  "elina2810/ecup-bi-scores"
+ ],
+ "kernel_sources": [
+  "elina2810/ecup-ce-dity",
+  "elina2810/ecup-ce-bge"
+ ],
+ "competition_sources": []
+}

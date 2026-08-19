@@ -1,0 +1,19 @@
+{
+ "id": "evgenymalkov/ecup-score-two",
+ "title": "ECUP score two",
+ "code_file": "ecup-score-two.ipynb",
+ "language": "python",
+ "kernel_type": "notebook",
+ "is_private": true,
+ "enable_gpu": true,
+ "enable_internet": false,
+ "dataset_sources": [
+  "evgenymalkov/ecup-matching-pack",
+  "evgenymalkov/ecup-llm-2m",
+  "evgenymalkov/ecup-code",
+  "evgenymalkov/ecup-encoders",
+  "evgenymalkov/ecup-encoders-fp16"
+ ],
+ "kernel_sources": [],
+ "competition_sources": []
+}

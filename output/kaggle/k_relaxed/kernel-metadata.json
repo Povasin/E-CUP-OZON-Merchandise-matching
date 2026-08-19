@@ -1,0 +1,16 @@
+{
+  "id": "semenmaskviten/ecup-ce-relaxed",
+  "title": "ECUP ce relaxed",
+  "code_file": "ecup-ce-relaxed.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "dataset_sources": [
+    "semenmaskviten/ecup-matching-data",
+    "semenmaskviten/ecup-matching-src"
+  ],
+  "kernel_sources": [],
+  "competition_sources": []
+}

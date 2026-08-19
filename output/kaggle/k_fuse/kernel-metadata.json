@@ -1,0 +1,17 @@
+{
+ "id": "evgenymalkov/ecup-fuse",
+ "title": "ECUP fuse",
+ "code_file": "ecup-fuse.ipynb",
+ "language": "python",
+ "kernel_type": "notebook",
+ "is_private": true,
+ "enable_gpu": false,
+ "enable_internet": false,
+ "dataset_sources": [
+  "evgenymalkov/ecup-llm-valid",
+  "evgenymalkov/ecup-code",
+  "evgenymalkov/ecup-fuse-scores"
+ ],
+ "kernel_sources": [],
+ "competition_sources": []
+}

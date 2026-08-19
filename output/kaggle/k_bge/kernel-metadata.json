@@ -1,0 +1,17 @@
+{
+ "id": "evgenymalkov/ecup-ce-bge",
+ "title": "ECUP ce bge",
+ "code_file": "ecup-ce-bge.ipynb",
+ "language": "python",
+ "kernel_type": "notebook",
+ "is_private": true,
+ "enable_gpu": true,
+ "enable_internet": true,
+ "dataset_sources": [
+  "evgenymalkov/ecup-matching-pack",
+  "evgenymalkov/ecup-code",
+  "evgenymalkov/ecup-hard"
+ ],
+ "kernel_sources": [],
+ "competition_sources": []
+}

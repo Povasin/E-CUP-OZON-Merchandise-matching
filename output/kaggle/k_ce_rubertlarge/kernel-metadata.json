@@ -1,0 +1,16 @@
+{
+ "id": "evgenymalkov/ecup-ce-rubert-large",
+ "title": "ECUP ce ruBert-large",
+ "code_file": "ecup-ce-rubert-large.ipynb",
+ "language": "python",
+ "kernel_type": "notebook",
+ "is_private": true,
+ "enable_gpu": true,
+ "enable_internet": true,
+ "dataset_sources": [
+  "evgenymalkov/ecup-matching-pack",
+  "evgenymalkov/ecup-code"
+ ],
+ "kernel_sources": [],
+ "competition_sources": []
+}

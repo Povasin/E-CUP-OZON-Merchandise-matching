@@ -1,0 +1,23 @@
+{
+ "id": "evgenymalkov/ecup-e2e-three",
+ "title": "ECUP e2e three",
+ "code_file": "ecup-e2e-three.ipynb",
+ "language": "python",
+ "kernel_type": "notebook",
+ "is_private": true,
+ "enable_gpu": true,
+ "accelerator": "nvidiaTeslaT4",
+ "enable_internet": false,
+ "dataset_sources": [
+  "evgenymalkov/ecup-llm-2m",
+  "evgenymalkov/ecup-code",
+  "evgenymalkov/ecup-structural",
+  "evgenymalkov/ecup-encoders",
+  "evgenymalkov/ecup-encoders-fp16"
+ ],
+ "kernel_sources": [
+  "evgenymalkov/ecup-ce-hardneg",
+  "evgenymalkov/ecup-final3"
+ ],
+ "competition_sources": []
+}

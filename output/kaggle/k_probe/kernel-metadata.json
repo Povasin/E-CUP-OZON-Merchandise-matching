@@ -1,0 +1,14 @@
+{
+  "id": "semenmaskviten/probe",
+  "title": "probe",
+  "code_file": "probe.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": false,
+  "dataset_sources": [],
+  "kernel_sources": [],
+  "competition_sources": [],
+  "machine_shape": "NvidiaTeslaT4"
+}

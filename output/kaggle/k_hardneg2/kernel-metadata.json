@@ -1,0 +1,17 @@
+{
+ "id": "evgenymalkov/ecup-ce-hardneg",
+ "title": "ECUP ce hardneg",
+ "code_file": "ecup-ce-hardneg.ipynb",
+ "language": "python",
+ "kernel_type": "notebook",
+ "is_private": true,
+ "enable_gpu": true,
+ "enable_internet": false,
+ "dataset_sources": [
+  "evgenymalkov/ecup-matching-pack",
+  "evgenymalkov/ecup-code",
+  "evgenymalkov/ecup-hard"
+ ],
+ "kernel_sources": [],
+ "competition_sources": []
+}
