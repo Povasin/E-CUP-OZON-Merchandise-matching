@@ -26,7 +26,7 @@ import pandas as pd
 
 from src.data import attach_texts, build_item_text
 from src.metrics import macro_pr_auc
-from src.scoring import score_pairs
+from src.pipeline import predict_scores
 
 PUBLIC_PAIRS = 115_000
 PRIVATE_PAIRS = 275_000
@@ -74,13 +74,12 @@ def main() -> None:
     used_ids = pd.unique(np.concatenate([matches["id1"].to_numpy(), matches["id2"].to_numpy()]))
     items = items_all[items_all["id"].isin(used_ids)].copy()
     items["text"] = build_item_text(items)
-    items = items[["id", "text", "category"]]
     print(f"Пар: {len(matches)} | товаров в прогоне: {len(items)} | категорий: {items['category'].nunique()}")
 
     pairs = attach_texts(matches, items)
 
     t0 = time.perf_counter()
-    scores = score_pairs(pairs, method=args.method)
+    pairs, scores = predict_scores(matches, items, method=args.method, pairs=pairs)
     score_time = time.perf_counter() - t0
 
     macro, per_cat = macro_pr_auc(pairs["target"].to_numpy(), scores, pairs["category"].to_numpy())

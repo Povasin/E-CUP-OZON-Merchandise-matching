@@ -1,92 +1,134 @@
-"""Fast, model-free pair features for supervised product matching.
-
-The features describe relations between two cards rather than memorising concrete
-products.  This is important for the competition test, where every product is new.
-"""
+"""Field-aware, leakage-free pair features for supervised product matching (Hybrid)."""
 from __future__ import annotations
 
 import json
 import math
 import re
+from collections import Counter
 from dataclasses import dataclass
+from functools import lru_cache
+from typing import Iterable
+
+import os
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
 
 import numpy as np
 import pandas as pd
 
 
-TOKEN_RE = re.compile(r"[0-9a-zа-яё]+", re.IGNORECASE)
-ARTICLE_KEYS = ("артикул", "модель", "партномер", "oem", "код товара", "sku")
-BRAND_KEYS = ("бренд", "производитель", "марка")
-SIZE_KEYS = ("размер",)
-COLOR_KEYS = ("цвет",)
-
-# Discriminative but low-IDF tokens: two apparel/footwear cards that differ only in
-# size/colour/gender are DIFFERENT products, yet lexically near-identical.  Explicit
-# conflict signals rescue exactly the categories where set overlap cannot separate them.
-COLOR_LEXICON = frozenset(
-    """черный белый красный синий зеленый желтый серый коричневый розовый оранжевый
-    фиолетовый голубой бежевый золотой серебряный бордовый бирюзовый сиреневый бронзовый
-    малиновый салатовый хаки пудровый молочный кремовый графитовый черная белая черное
-    белое black white red blue green yellow gray grey brown pink orange purple beige gold
-    silver""".split()
+TOKEN_RE = re.compile(r"\d+[.,]\d+|\d+|[a-zа-яё]+")
+ALNUM_RE = re.compile(r"[a-zа-яё]*\d[a-zа-яё\d]*|\d+[a-zа-яё]+[a-zа-яё\d]*", re.I)
+SIGN_NUM_RE = re.compile(r"[+-]?\d+(?:[.,]\d+)?")
+MEASURE_RE = re.compile(
+    r"(?P<value>[+-]?\d+(?:[.,]\d+)?)\s*(?P<unit>kg|кг|g|г|mg|мг|ml|мл|l|л|mm|мм|cm|см|m|м|km|км|gb|гб|mb|мб|tb|тб|w|вт|kw|квт|v|в|шт|pcs|pc|units|ед|\bшт\b|%)\b",
+    re.I,
 )
-GENDER_LEXICON = frozenset(
-    """мужской женский детский унисекс мужская женская мужчин женщин male female unisex
-    мальчик девочка мужские женские детские""".split()
+DIMENSION_RE = re.compile(
+    r"(?P<a>[+-]?\d+(?:[.,]\d+)?)\s*[xх×]\s*(?P<b>[+-]?\d+(?:[.,]\d+)?)(?:\s*[xх×]\s*(?P<c>[+-]?\d+(?:[.,]\d+)?))?\s*(?P<unit>mm|мм|cm|см|m|м)\b",
+    re.I,
 )
 
-# Quantity with units generalises across the whole catalogue: two otherwise identical
-# cards with a different pack size / weight / volume are different products.  Units are
-# normalised to a base per dimension so "1 л" and "500 мл" become comparable numbers.
-QUANTITY_UNITS = {
-    "мл": ("vol", 1.0), "ml": ("vol", 1.0), "л": ("vol", 1000.0), "l": ("vol", 1000.0),
-    "литр": ("vol", 1000.0),
-    "мг": ("mass", 0.001), "мкг": ("mass", 1e-6), "г": ("mass", 1.0), "гр": ("mass", 1.0),
-    "g": ("mass", 1.0), "кг": ("mass", 1000.0), "kg": ("mass", 1000.0),
-    "мм": ("len", 1.0), "см": ("len", 10.0), "м": ("len", 1000.0), "mm": ("len", 1.0),
-    "cm": ("len", 10.0),
-    "шт": ("count", 1.0), "pcs": ("count", 1.0), "таб": ("count", 1.0), "капс": ("count", 1.0),
+UNIT_FACTORS = {
+    "mg": ("mass_g", 0.001), "мг": ("mass_g", 0.001),
+    "g": ("mass_g", 1.0), "г": ("mass_g", 1.0),
+    "kg": ("mass_g", 1000.0), "кг": ("mass_g", 1000.0),
+    "ml": ("volume_ml", 1.0), "мл": ("volume_ml", 1.0),
+    "l": ("volume_ml", 1000.0), "л": ("volume_ml", 1000.0),
+    "mm": ("length_mm", 1.0), "мм": ("length_mm", 1.0),
+    "cm": ("length_mm", 10.0), "см": ("length_mm", 10.0),
+    "m": ("length_mm", 1000.0), "м": ("length_mm", 1000.0),
+    "km": ("length_mm", 1_000_000.0), "км": ("length_mm", 1_000_000.0),
+    "gb": ("storage_mb", 1024.0), "гб": ("storage_mb", 1024.0),
+    "mb": ("storage_mb", 1.0), "мб": ("storage_mb", 1.0),
+    "tb": ("storage_mb", 1024.0 * 1024.0), "тб": ("storage_mb", 1024.0 * 1024.0),
+    "w": ("power_w", 1.0), "вт": ("power_w", 1.0),
+    "kw": ("power_w", 1000.0), "квт": ("power_w", 1000.0),
+    "v": ("voltage_v", 1.0), "в": ("voltage_v", 1.0),
+    "шт": ("quantity", 1.0), "pcs": ("quantity", 1.0), "pc": ("quantity", 1.0),
+    "units": ("quantity", 1.0), "ед": ("quantity", 1.0),
+    "%": ("percent", 1.0),
 }
-QUANTITY_RE = re.compile(r"(\d+(?:[.,]\d+)?)\s?([а-яёa-z]+)")
 
+IDENTIFIER_KEYS = (
+    "sku", "код товара", "артикул", "арт", "партномер", "part number",
+    "номер детали", "oem", "оем", "артикул производителя", "партномер производителя",
+)
+MODEL_KEYS = ("модель", "model", "серия", "линейка", "коллекция")
+BRAND_KEYS = ("бренд", "brand", "производитель", "producer", "марка")
+TYPE_KEYS = ("тип", "вид", "тип изделия", "вид изделия", "тип продукта", "вид товара", "назначение")
+COLOR_KEYS = ("цвет", "color", "оттенок")
 
-def _extract_quantities(name: object, raw_attrs: object) -> frozenset[str]:
-    """Set of "dimension:base_value" strings parsed from name + attribute values."""
-    parts: list[str] = []
-    if name is not None and not (isinstance(name, float) and pd.isna(name)):
-        parts.append(str(name))
-    if raw_attrs is not None and not (isinstance(raw_attrs, float) and pd.isna(raw_attrs)):
-        try:
-            parsed = json.loads(str(raw_attrs))
-        except (TypeError, ValueError, json.JSONDecodeError):
-            parsed = None
-        if isinstance(parsed, dict):
-            parts.extend(str(value) for value in parsed.values())
-        elif parsed is not None:
-            parts.append(str(parsed))
-    text = " ".join(parts).lower().replace("ё", "е")
-    if not text:
-        return frozenset()
-    values: set[str] = set()
-    for number, unit in QUANTITY_RE.findall(text):
-        info = QUANTITY_UNITS.get(unit)
-        if info is None:
-            continue
-        dimension, multiplier = info
-        base_value = round(float(number.replace(",", ".")) * multiplier, 4)
-        values.add(f"{dimension}:{base_value:g}")
-    return frozenset(values)
+SEMANTIC_KEY_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("package_quantity", ("количество предметов в упаковке", "единиц в одном товаре", "количество в упаковке", "количество упаковок", "штук в упаковке", "количество ручек", "количество линз")),
+    ("pet_size", ("размер животного", "размер птицы", "размер собаки", "размер кошки")),
+    ("manufacturer_size", ("размер производителя", "eur размер", "размер обуви производителя")),
+    ("shoe_size_ru", ("российский размер", "ru размер")),
+    ("package_dimension", ("размер упаковки", "габарит упаковки", "длина упаковки", "ширина упаковки", "высота упаковки", "размеры упаковки")),
+    ("product_dimension", ("габарит", "размеры", "размер товара", "длина", "ширина", "высота", "диаметр", "размер моста", "ширина линзы", "высота линзы", "длина заушника", "общая ширина")),
+    ("weight", ("вес", "масса")),
+    ("volume", ("объем", "вместимость")),
+    ("power", ("мощность", "power")),
+    ("voltage", ("напряжение", "voltage")),
+    ("optical_power", ("оптическая сила", "диоптр", "sphere", "сфер")),
+    ("cylinder", ("цилиндр", "cyl")),
+    ("axis", ("ось", "axis", "ах")),
+    ("radius", ("радиус кривизны", "радиус")),
+    ("quantity", ("количество", "шт", "pcs", "units")),
+    ("format", ("формат",)),
+    ("density", ("плотность",)),
+    ("type", TYPE_KEYS),
+    ("brand", BRAND_KEYS),
+    ("color", COLOR_KEYS),
+    ("identifier", IDENTIFIER_KEYS),
+    ("model", MODEL_KEYS),
+    ("composition", ("состав", "ингредиенты", "материал", "материал изделия", "материал корпуса", "материал линз", "материал оправы")),
+)
 
+CATEGORY_CRITICAL_FIELDS = {
+    "аптека": {"optical_power", "cylinder", "axis", "radius", "product_dimension", "package_quantity", "identifier", "model"},
+    "автотовары": {"identifier", "model", "brand", "type", "product_dimension"},
+    "обувь": {"model", "manufacturer_size", "shoe_size_ru", "color", "type", "brand"},
+    "товары для животных": {"brand", "model", "pet_size", "package_quantity", "weight", "volume", "composition", "type"},
+    "канцелярские товары": {"format", "product_dimension", "package_quantity", "density", "type", "brand"},
+    "красота и гигиена": {"brand", "model", "volume", "weight", "composition", "type", "color"},
+    "бытовая техника": {"brand", "model", "product_dimension", "volume", "weight", "power", "type", "identifier"},
+}
+
+FIELD_WEIGHT = {
+    "identifier": 5.0, "model": 4.0, "type": 3.0, "package_quantity": 3.0,
+    "weight": 3.0, "volume": 3.0, "shoe_size_ru": 3.0, "manufacturer_size": 3.0,
+    "optical_power": 5.0, "cylinder": 5.0, "axis": 5.0, "radius": 4.0,
+    "pet_size": 2.5, "product_dimension": 2.5, "brand": 2.0, "composition": 2.0,
+    "color": 1.0, "format": 1.5, "density": 1.5, "power": 2.0, "voltage": 2.0,
+    "quantity": 2.5,
+}
+
+def _is_missing(value: object) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, float):
+        return math.isnan(value)
+    return False
 
 def _normalise(value: object) -> str:
-    if value is None or pd.isna(value):
+    if _is_missing(value):
         return ""
-    return " ".join(TOKEN_RE.findall(str(value).lower().replace("ё", "е")))
+    s = str(value).lower().replace("ё", "е")
+    return " ".join(TOKEN_RE.findall(s))
 
+def _compact_alnum(value: object) -> str:
+    if _is_missing(value):
+        return ""
+    s = str(value).lower().replace("ё", "е")
+    return re.sub(r"[^0-9a-zа-я]+", "", s)
 
 def _tokens(value: str) -> frozenset[str]:
     return frozenset(value.split())
 
+def _ordered_tokens(value: str) -> tuple[str, ...]:
+    return tuple(value.split())
 
 def _char_ngrams(value: str, n: int = 3) -> frozenset[str]:
     compact = value.replace(" ", "")
@@ -94,873 +136,551 @@ def _char_ngrams(value: str, n: int = 3) -> frozenset[str]:
         return frozenset()
     if len(compact) <= n:
         return frozenset((compact,))
-    return frozenset(compact[i : i + n] for i in range(len(compact) - n + 1))
+    return frozenset(compact[i:i+n] for i in range(len(compact) - n + 1))
 
-
-def _parse_attributes(raw: object) -> dict[str, str]:
-    if raw is None or pd.isna(raw):
+def _safe_json(raw: object) -> object:
+    if _is_missing(raw):
+        return {}
+    raw_str = str(raw)
+    if not raw_str or raw_str == "{}" or raw_str.lower() == "null":
         return {}
     try:
-        parsed = json.loads(str(raw))
+        return json.loads(raw_str)
     except (TypeError, ValueError, json.JSONDecodeError):
         return {}
+
+def _flatten_text(value: object) -> str:
+    if isinstance(value, (list, tuple, set)):
+        return " ".join(_flatten_text(x) for x in value)
+    if isinstance(value, dict):
+        return " ".join(f"{k} {_flatten_text(v)}" for k, v in value.items())
+    return str(value)
+
+def _parse_attributes(raw: object) -> dict[str, str]:
+    parsed = _safe_json(raw)
     if not isinstance(parsed, dict):
         return {}
     result: dict[str, str] = {}
     for key, value in parsed.items():
         norm_key = _normalise(key)
-        norm_value = _normalise(value)
+        norm_value = _normalise(_flatten_text(value))
         if norm_key and norm_value:
             result[norm_key] = norm_value
     return result
 
+_NORMALIZED_SEMANTIC_RULES = None
 
-def _selected_values(attrs: dict[str, str], needles: tuple[str, ...]) -> frozenset[str]:
+@lru_cache(maxsize=8192)
+def _canonical_field(key: str) -> str | None:
+    global _NORMALIZED_SEMANTIC_RULES
+    if _NORMALIZED_SEMANTIC_RULES is None:
+        _NORMALIZED_SEMANTIC_RULES = tuple(
+            (field, tuple(_normalise(needle) for needle in needles))
+            for field, needles in SEMANTIC_KEY_RULES
+        )
+    k = _normalise(key)
+    if not k:
+        return None
+    for field, needles in _NORMALIZED_SEMANTIC_RULES:
+        for needle in needles:
+            if k == needle or needle in k:
+                return field
+    return None
+
+def _selected_values(attrs: dict[str, str], fields: Iterable[str]) -> frozenset[str]:
+    wanted = set(fields)
     values: set[str] = set()
     for key, value in attrs.items():
-        if any(needle in key for needle in needles):
+        if _canonical_field(key) in wanted:
             values.update(value.split())
     return frozenset(values)
 
+def _extract_identifier_strings(value: object) -> frozenset[str]:
+    if _is_missing(value):
+        return frozenset()
+    s = str(value).lower().replace("ё", "е")
+    candidates = re.findall(r"(?=[a-zа-я0-9]*[a-zа-я])(?=[a-zа-я0-9]*\d)[a-zа-я0-9]+", re.sub(r"[^a-zа-я0-9]+", " ", s))
+    return frozenset(x for x in candidates if len(x) >= 2)
 
-def _compact_identifier_tokens(attrs: dict[str, str]) -> frozenset[str]:
-    """Article/model identifiers invariant to spaces, hyphens and underscores.
-
-    Marketplace schemas frequently store the same identifier as ``sh-p7251`` and
-    ``shp7251`` or as ``gdb2070 zfr`` and ``gdb2070zfr``. Normal token overlap misses
-    these exact matches, while concatenating only adjacent identifier fragments keeps
-    the signal precise.
-    """
-    result: set[str] = set()
-    for key, value in attrs.items():
-        if not any(needle in key for needle in ARTICLE_KEYS):
+def _numbers(value: object) -> tuple[float, ...]:
+    if _is_missing(value):
+        return ()
+    out = []
+    for m in SIGN_NUM_RE.findall(str(value)):
+        try:
+            out.append(float(m.replace(",", ".")))
+        except ValueError:
             continue
-        parts = value.split()
-        for part in parts:
-            if len(part) >= 3 and any(char.isdigit() for char in part):
-                result.add(part)
-        for width in (2, 3):
-            for start in range(len(parts) - width + 1):
-                compact = "".join(parts[start : start + width])
-                if 4 <= len(compact) <= 64 and any(char.isdigit() for char in compact):
-                    result.add(compact)
-    return frozenset(result)
+    return tuple(out)
 
+def _canonical_measurements(key: str | None, value: object) -> list[tuple[str, float]]:
+    if _is_missing(value):
+        return []
+    raw = str(value).lower().replace("ё", "е")
+    semantic = key or ""
+    result: list[tuple[str, float]] = []
 
-def _compact_name_identifiers(name: str) -> frozenset[str]:
-    """Model-like name fragments, invariant to separators."""
-    parts = name.split()
-    result: set[str] = {
-        part for part in parts if len(part) >= 3 and any(char.isdigit() for char in part)
-    }
-    for width in (2, 3):
-        for start in range(len(parts) - width + 1):
-            compact = "".join(parts[start : start + width])
-            if 4 <= len(compact) <= 48 and any(char.isdigit() for char in compact):
-                result.add(compact)
-    return frozenset(result)
+    for m in DIMENSION_RE.finditer(raw):
+        unit = m.group("unit").lower()
+        family, factor = UNIT_FACTORS[unit]
+        for name, number in (("d1", m.group("a")), ("d2", m.group("b")), ("d3", m.group("c"))):
+            if number is not None:
+                result.append(("product_dimension" if semantic in {"product_dimension", "package_dimension"} else family, float(number.replace(",", ".")) * factor))
 
+    for m in MEASURE_RE.finditer(raw):
+        unit = m.group("unit").lower()
+        if unit not in UNIT_FACTORS:
+            continue
+        family, factor = UNIT_FACTORS[unit]
+        num = float(m.group("value").replace(",", "."))
+        if semantic == "weight": family = "mass_g"
+        elif semantic == "volume": family = "volume_ml"
+        elif semantic == "power": family = "power_w"
+        elif semantic == "voltage": family = "voltage_v"
+        elif semantic in {"package_quantity", "quantity"}: family = "quantity"
+        elif semantic in {"optical_power", "cylinder", "axis", "radius", "shoe_size_ru", "manufacturer_size", "pet_size"}:
+            family = semantic
+            factor = 1.0
+        elif semantic in {"product_dimension", "package_dimension"} and family == "length_mm":
+            family = semantic
+        result.append((family, num * factor))
 
-def _semantic_value_groups(attrs: dict[str, str]) -> tuple[frozenset[str], ...]:
-    """Schema-tolerant token sets for important product-identity fields."""
-    grouped: list[set[str]] = [set() for _ in range(4)]
-    for key, value in attrs.items():
-        keys = (
-            key == "тип" or key in {"вид товара", "название группы"},
-            ("модель" in key.split() and "на модели" not in key)
-            or any(term in key for term in ("серия", "линейка")),
-            any(term in key for term in ("материал", "состав")),
-            any(term in key for term in ("коллекц", "серия", "линейка")),
-        )
-        for index, selected in enumerate(keys):
-            if selected:
-                grouped[index].update(value.split())
-    return tuple(frozenset(values) for values in grouped)
+    if not result and semantic in {"optical_power", "cylinder", "axis", "radius", "shoe_size_ru", "manufacturer_size", "quantity", "package_quantity", "density", "weight", "volume", "power", "voltage"}:
+        for num in _numbers(raw):
+            result.append((semantic, num))
+    return result
 
+def _canonical_text(value: object) -> str:
+    return " ".join(_normalise(value).split())
 
-def _is_family_key(key: str, family: str) -> bool:
-    words = set(key.split())
-    if family == "size":
-        return "размер" in words and not any(
-            noise in key for noise in ("на модели", "модели на фото", "упаков", "параметр")
-        )
-    if family == "color":
-        return "цвет" in words
-    if family == "gender":
-        return "пол" in words
-    if family == "type":
-        return key == "тип" or key in {"вид товара", "название группы"}
-    if family == "model":
-        return "модель" in words and not any(
-            noise in key for noise in ("на модели", "модели на фото", "параметр")
-        )
-    raise ValueError(f"Unknown attribute family: {family}")
+def _set_stats(left: frozenset[str], right: frozenset[str]) -> tuple[float, float, float, float]:
+    len_l = len(left); len_r = len(right)
+    if not len_l and not len_r:
+        return 0.0, 0.0, 0.0, 0.0
+    common = len(left & right)
+    union = len_l + len_r - common
+    jaccard = common / union if union else 0.0
+    dice = 2.0 * common / (len_l + len_r) if (len_l or len_r) else 0.0
+    containment = common / min(len_l, len_r) if min(len_l, len_r) else 0.0
+    count_ratio = min(len_l, len_r) / max(len_l, len_r) if max(len_l, len_r) else 0.0
+    return jaccard, dice, containment, count_ratio
 
+def _weighted_set_overlap(left: frozenset[str], right: frozenset[str]) -> tuple[float, float]:
+    if not left and not right:
+        return 0.0, 0.0
+    def w(token: str) -> float:
+        length_bonus = min(len(token), 12) / 12.0
+        id_bonus = 1.8 if any(ch.isdigit() for ch in token) else 0.0
+        alpha_num_bonus = 1.4 if bool(ALNUM_RE.fullmatch(token)) else 0.0
+        generic_penalty = 0.65 if len(token) <= 3 and token.isalpha() else 0.0
+        return max(0.25, 0.8 + length_bonus + id_bonus + alpha_num_bonus - generic_penalty)
+    l_sum = sum(w(t) for t in left); r_sum = sum(w(t) for t in right)
+    inter = sum(w(t) for t in left & right)
+    union = l_sum + r_sum - inter
+    containment = inter / min(l_sum, r_sum) if min(l_sum, r_sum) else 0.0
+    return (inter / union if union else 0.0), containment
 
-def _family_attributes(attrs: dict[str, str]) -> tuple[dict[str, str], ...]:
-    """Precompute small semantic-key maps once per product, not once per pair."""
-    return tuple(
-        {key: value for key, value in attrs.items() if _is_family_key(key, family)}
-        for family in ("size", "color", "gender", "type", "model")
-    )
+def _lcs_ratio(a: tuple[str, ...], b: tuple[str, ...]) -> float:
+    if not a or not b:
+        return 0.0
+    a = a[:80]; b = b[:80]
+    prev = [0] * (len(b) + 1)
+    for x in a:
+        cur = [0]
+        for j, y in enumerate(b, 1):
+            cur.append(prev[j-1] + 1 if x == y else max(prev[j], cur[-1]))
+        prev = cur
+    return prev[-1] / max(1, min(len(a), len(b)))
 
+def _common_prefix_tokens(a: tuple[str, ...], b: tuple[str, ...]) -> float:
+    n = min(len(a), len(b))
+    i = 0
+    while i < n and a[i] == b[i]:
+        i += 1
+    return i / max(1, n)
 
-def _family_key_stats(
-    left: dict[str, str], right: dict[str, str]
-) -> tuple[float, float, float, float]:
-    """Exact-key value agreement without dilution by unrelated shared attributes."""
-    left_keys = set(left)
-    right_keys = set(right)
-    shared = left_keys & right_keys
-    if not shared:
-        return 0.0, 0.0, 0.0, float(bool(left_keys) == bool(right_keys))
-    exact = 0
-    similarity = 0.0
-    conflicts = 0
-    for key in shared:
-        left_value = left[key]
-        right_value = right[key]
-        exact += int(left_value == right_value)
-        value_jaccard = _set_stats(_tokens(left_value), _tokens(right_value))[0]
-        similarity += value_jaccard
-        conflicts += int(value_jaccard == 0.0)
-    count = len(shared)
-    return exact / count, similarity / count, conflicts / count, 1.0
-
-
-def _v10_feature_values(
-    left_identifiers: frozenset[str],
-    right_identifiers: frozenset[str],
-    left_families: tuple[dict[str, str], ...],
-    right_families: tuple[dict[str, str], ...],
-) -> list[float]:
-    compact_ids = _set_stats(left_identifiers, right_identifiers)
-    both_compact_ids = bool(left_identifiers and right_identifiers)
-    family_stats = tuple(
-        value
-        for left_family, right_family in zip(left_families, right_families)
-        for value in _family_key_stats(left_family, right_family)
-    )
-    return [
-        compact_ids[0], compact_ids[2],
-        float(both_compact_ids and bool(left_identifiers & right_identifiers)),
-        float(both_compact_ids and not (left_identifiers & right_identifiers)),
-        float(bool(left_identifiers) == bool(right_identifiers)),
-        *family_stats,
-    ]
-
-
-def _v11_feature_values(
-    left_name_ids: frozenset[str],
-    right_name_ids: frozenset[str],
-    left_value_phrases: frozenset[str],
-    right_value_phrases: frozenset[str],
-    left_key_values: frozenset[str],
-    right_key_values: frozenset[str],
-    left_semantic: tuple[frozenset[str], ...],
-    right_semantic: tuple[frozenset[str], ...],
-) -> list[float]:
-    name_ids = _set_stats(left_name_ids, right_name_ids)
-    both_name_ids = bool(left_name_ids and right_name_ids)
-    value_phrases = _set_stats(left_value_phrases, right_value_phrases)
-    key_values = _set_stats(left_key_values, right_key_values)
-    semantic = tuple(
-        value
-        for left_values, right_values in zip(left_semantic, right_semantic)
-        for value in _class_conflict(left_values, right_values)
-    )
-    return [
-        name_ids[0], name_ids[2],
-        float(both_name_ids and bool(left_name_ids & right_name_ids)),
-        float(both_name_ids and not (left_name_ids & right_name_ids)),
-        float(bool(left_name_ids) == bool(right_name_ids)),
-        *value_phrases,
-        *key_values,
-        *semantic,
-    ]
-
-
-def _count_features(left: frozenset, right: frozenset) -> tuple[float, float, float]:
-    left_count = len(left)
-    right_count = len(right)
-    return (
-        math.log1p(min(left_count, right_count)),
-        math.log1p(max(left_count, right_count)),
-        math.log1p(abs(left_count - right_count)),
-    )
-
-
-def _v12_feature_values(
-    left_name_tokens: frozenset[str],
-    right_name_tokens: frozenset[str],
-    left_attr_keys: frozenset[str],
-    right_attr_keys: frozenset[str],
-    left_value_tokens: frozenset[str],
-    right_value_tokens: frozenset[str],
-    left_value_phrases: frozenset[str],
-    right_value_phrases: frozenset[str],
-    left_key_values: frozenset[str],
-    right_key_values: frozenset[str],
-    left_name_ids: frozenset[str],
-    right_name_ids: frozenset[str],
-    left_compact_ids: frozenset[str],
-    right_compact_ids: frozenset[str],
-) -> list[float]:
-    return [
-        *_count_features(left_name_tokens, right_name_tokens),
-        *_count_features(left_attr_keys, right_attr_keys),
-        *_count_features(left_value_tokens, right_value_tokens),
-        *_count_features(left_value_phrases, right_value_phrases),
-        math.log1p(len(left_value_phrases & right_value_phrases)),
-        math.log1p(len(left_key_values & right_key_values)),
-        math.log1p(len(left_name_ids & right_name_ids)),
-        math.log1p(len(left_compact_ids & right_compact_ids)),
-        float(bool(left_attr_keys) != bool(right_attr_keys)),
-        float(bool(left_name_ids) != bool(right_name_ids)),
-    ]
-
-
-def _v13_feature_values(
-    left_name: str,
-    right_name: str,
-    left_attrs: dict[str, str],
-    right_attrs: dict[str, str],
-    left_digits: frozenset[str],
-    right_digits: frozenset[str],
-    left_articles: frozenset[str],
-    right_articles: frozenset[str],
-    left_compact_ids: frozenset[str],
-    right_compact_ids: frozenset[str],
-    left_quantities: frozenset[str],
-    right_quantities: frozenset[str],
-) -> list[float]:
-    shared_keys = set(left_attrs) & set(right_attrs)
-    exact = 0
-    conflicts = 0
-    for key in shared_keys:
-        left_value = left_attrs[key]
-        right_value = right_attrs[key]
-        exact += int(left_value == right_value)
-        conflicts += int(not (_tokens(left_value) & _tokens(right_value)))
-    left_attr_chars = sum(len(key) + len(value) for key, value in left_attrs.items())
-    right_attr_chars = sum(len(key) + len(value) for key, value in right_attrs.items())
-    return [
-        *_count_features(left_digits, right_digits),
-        *_count_features(left_articles, right_articles),
-        *_count_features(left_compact_ids, right_compact_ids),
-        *_count_features(left_quantities, right_quantities),
-        math.log1p(min(len(left_name), len(right_name))),
-        math.log1p(max(len(left_name), len(right_name))),
-        math.log1p(abs(len(left_name) - len(right_name))),
-        math.log1p(min(left_attr_chars, right_attr_chars)),
-        math.log1p(max(left_attr_chars, right_attr_chars)),
-        math.log1p(abs(left_attr_chars - right_attr_chars)),
-        math.log1p(len(shared_keys)),
-        math.log1p(exact),
-        math.log1p(conflicts),
-    ]
-
+def _field_similarity_dict(left: dict[str, tuple[str, ...]], right: dict[str, tuple[str, ...]]) -> tuple[float, float, int, int]:
+    keys = set(left) | set(right)
+    if not keys:
+        return 0.0, 0.0, 0, 0
+    weighted_sum = 0.0; weight_total = 0.0; conflicts = 0; shared = 0
+    for key in keys:
+        lv = left.get(key); rv = right.get(key)
+        w = FIELD_WEIGHT.get(key, 1.0)
+        if lv and rv:
+            shared += 1
+            sim = _set_stats(frozenset(lv), frozenset(rv))[0]
+            weighted_sum += w * sim
+            weight_total += w
+            if sim == 0.0:
+                conflicts += 1
+    return (weighted_sum / weight_total if weight_total else 0.0), (weight_total / sum(FIELD_WEIGHT.get(k, 1.0) for k in keys) if keys else 0.0), conflicts, shared
 
 @dataclass(frozen=True, slots=True)
 class ProductView:
+    category: str
     name: str
+    compact_name: str
     name_tokens: frozenset[str]
+    ordered_tokens: tuple[str, ...]
     name_grams: frozenset[str]
     name_grams4: frozenset[str]
-    name_grams5: frozenset[str]
     attrs: dict[str, str]
-    family_attrs: tuple[dict[str, str], ...]
     attr_keys: frozenset[str]
     value_tokens: frozenset[str]
     all_tokens: frozenset[str]
     digit_tokens: frozenset[str]
-    num_values: frozenset[float]
+    identifier_tokens: frozenset[str]
     article_tokens: frozenset[str]
-    compact_identifiers: frozenset[str]
-    name_identifiers: frozenset[str]
-    value_phrases: frozenset[str]
-    key_value_pairs: frozenset[str]
-    semantic_values: tuple[frozenset[str], ...]
+    model_tokens: frozenset[str]
+    sku_tokens: frozenset[str]
+    oem_tokens: frozenset[str]
     brand_tokens: frozenset[str]
-    size_tokens: frozenset[str]
     color_tokens: frozenset[str]
-    gender_tokens: frozenset[str]
-    quantities: frozenset[str]
-
+    type_tokens: frozenset[str]
+    size_tokens: frozenset[str]
+    composition_tokens: frozenset[str]
+    canonical_fields: dict[str, tuple[str, ...]]
+    numeric_fields: dict[str, tuple[float, ...]]
+    measurements: tuple[tuple[str, float], ...]
+    field_presence: frozenset[str]
 
 EMPTY_VIEW = ProductView(
-    name="",
-    name_tokens=frozenset(),
-    name_grams=frozenset(),
-    name_grams4=frozenset(),
-    name_grams5=frozenset(),
-    attrs={},
-    family_attrs=({}, {}, {}, {}, {}),
-    attr_keys=frozenset(),
-    value_tokens=frozenset(),
-    all_tokens=frozenset(),
-    digit_tokens=frozenset(),
-    num_values=frozenset(),
-    article_tokens=frozenset(),
-    compact_identifiers=frozenset(),
-    name_identifiers=frozenset(),
-    value_phrases=frozenset(),
-    key_value_pairs=frozenset(),
-    semantic_values=(frozenset(),) * 4,
-    brand_tokens=frozenset(),
-    size_tokens=frozenset(),
-    color_tokens=frozenset(),
-    gender_tokens=frozenset(),
-    quantities=frozenset(),
+    category="", name="", compact_name="", name_tokens=frozenset(), ordered_tokens=(),
+    name_grams=frozenset(), name_grams4=frozenset(), attrs={}, attr_keys=frozenset(),
+    value_tokens=frozenset(), all_tokens=frozenset(), digit_tokens=frozenset(),
+    identifier_tokens=frozenset(), article_tokens=frozenset(), model_tokens=frozenset(),
+    sku_tokens=frozenset(), oem_tokens=frozenset(), brand_tokens=frozenset(),
+    color_tokens=frozenset(), type_tokens=frozenset(), size_tokens=frozenset(),
+    composition_tokens=frozenset(), canonical_fields={}, numeric_fields={},
+    measurements=(), field_presence=frozenset()
 )
 
-
-def _gender_values(attrs: dict[str, str], name_tokens: frozenset[str]) -> frozenset[str]:
-    values: set[str] = set()
-    for key, value in attrs.items():
-        if "пол" in key.split():  # whole word, so "полнота" (width) is not gender
-            values.update(value.split())
-    values.update(token for token in name_tokens if token in GENDER_LEXICON)
-    return frozenset(values)
-
-
-def _make_view(name: object, raw_attrs: object) -> ProductView:
+def _make_view(name: object, raw_attrs: object, category: object = "") -> ProductView:
     norm_name = _normalise(name)
-    name_tokens = _tokens(norm_name)
     attrs = _parse_attributes(raw_attrs)
+    category_norm = _canonical_text(category)
+    name_tokens = _tokens(norm_name)
+    ordered = _ordered_tokens(norm_name)
     value_tokens = frozenset(token for value in attrs.values() for token in value.split())
     all_tokens = name_tokens | value_tokens
     digit_tokens = frozenset(token for token in all_tokens if any(ch.isdigit() for ch in token))
-    num_values = frozenset(float(token) for token in all_tokens if token.isdigit())
-    color_tokens = _selected_values(attrs, COLOR_KEYS) | frozenset(
-        token for token in name_tokens if token in COLOR_LEXICON
-    )
+
+    field_values: dict[str, list[str]] = {}
+    numeric_fields: dict[str, list[float]] = {}
+    measurements: list[tuple[str, float]] = []
+
+    for key, value in attrs.items():
+        field = _canonical_field(key)
+        if field:
+            field_values.setdefault(field, []).extend(value.split())
+            for family, num in _canonical_measurements(field, value):
+                measurements.append((family, num))
+                numeric_fields.setdefault(family, []).append(num)
+
+    for family, num in _canonical_measurements(None, name):
+        measurements.append((family, num))
+        numeric_fields.setdefault(family, []).append(num)
+
+    for m in DIMENSION_RE.finditer(str(name or "").lower()):
+        unit = m.group("unit").lower(); _, factor = UNIT_FACTORS[unit]
+        vals = [float(m.group("a").replace(",", ".")), float(m.group("b").replace(",", "."))]
+        if m.group("c"):
+            vals.append(float(m.group("c").replace(",", ".")))
+        numeric_fields.setdefault("product_dimension", []).extend([v * factor for v in vals])
+
+    name_identifiers = _extract_identifier_strings(name)
+    modelish = frozenset(t for t in name_identifiers if len(t) >= 3)
+
+    article = _selected_values(attrs, {"identifier"})
+    model = _selected_values(attrs, {"model"})
+    brand = _selected_values(attrs, {"brand"})
+    color = _selected_values(attrs, {"color"})
+    type_tokens = _selected_values(attrs, {"type"})
+    composition = _selected_values(attrs, {"composition"})
+
+    field_values_t = {k: tuple(sorted(set(v))) for k, v in field_values.items() if v}
+    numeric_fields_t = {k: tuple(v) for k, v in numeric_fields.items() if v}
+    identifier_tokens = frozenset(article | name_identifiers)
+
     return ProductView(
+        category=category_norm,
         name=norm_name,
+        compact_name=_compact_alnum(name),
         name_tokens=name_tokens,
-        name_grams=_char_ngrams(norm_name),
+        ordered_tokens=ordered,
+        name_grams=_char_ngrams(norm_name, 3),
         name_grams4=_char_ngrams(norm_name, 4),
-        name_grams5=_char_ngrams(norm_name, 5),
         attrs=attrs,
-        family_attrs=_family_attributes(attrs),
         attr_keys=frozenset(attrs),
         value_tokens=value_tokens,
         all_tokens=all_tokens,
         digit_tokens=digit_tokens,
-        num_values=num_values,
-        article_tokens=_selected_values(attrs, ARTICLE_KEYS),
-        compact_identifiers=_compact_identifier_tokens(attrs),
-        name_identifiers=_compact_name_identifiers(norm_name),
-        value_phrases=frozenset(attrs.values()),
-        key_value_pairs=frozenset(f"{key}={value}" for key, value in attrs.items()),
-        semantic_values=_semantic_value_groups(attrs),
-        brand_tokens=_selected_values(attrs, BRAND_KEYS),
-        size_tokens=_selected_values(attrs, SIZE_KEYS),
-        color_tokens=color_tokens,
-        gender_tokens=_gender_values(attrs, name_tokens),
-        quantities=_extract_quantities(name, raw_attrs),
+        identifier_tokens=identifier_tokens,
+        article_tokens=article,
+        model_tokens=model | frozenset(modelish),
+        sku_tokens=frozenset(t for t in article if any(x in str(raw_attrs).lower() for x in ("sku", "код товара"))),
+        oem_tokens=frozenset(t for t in article if "oem" in str(raw_attrs).lower() or "оем" in str(raw_attrs).lower()),
+        brand_tokens=brand,
+        color_tokens=color,
+        type_tokens=type_tokens,
+        size_tokens=_selected_values(attrs, {"pet_size", "manufacturer_size", "shoe_size_ru", "package_dimension", "product_dimension", "weight", "volume"}),
+        composition_tokens=composition,
+        canonical_fields=field_values_t,
+        numeric_fields=numeric_fields_t,
+        measurements=tuple(measurements),
+        field_presence=frozenset(field_values_t),
     )
 
-
 def build_product_views(items: pd.DataFrame) -> dict[int, ProductView]:
-    """Build compact parsed views once per product id."""
-    return {
-        int(item_id): _make_view(name, attrs)
-        for item_id, name, attrs in items[["id", "name", "attributes"]].itertuples(index=False, name=None)
-    }
+    columns = ["id", "name", "attributes"]
+    has_category = "category" in items.columns
+    if has_category:
+        columns.append("category")
 
+    views: dict[int, ProductView] = {}
+    for row in items[columns].itertuples(index=False, name=None):
+        item_id, name, attrs = row[:3]
+        category = row[3] if has_category else ""
+        views[int(item_id)] = _make_view(name, attrs, category)
+    return views
 
-def _build_idf(values, attr: bool) -> tuple[dict[str, float], float]:
-    """Document-frequency IDF over the run corpus (name or attribute tokens)."""
-    document_frequency: dict[str, int] = {}
-    n_documents = 0
-    for view in values:
-        n_documents += 1
-        tokens = view.value_tokens if attr else view.name_tokens
-        for token in tokens:
-            document_frequency[token] = document_frequency.get(token, 0) + 1
-    idf = {t: math.log((n_documents + 1) / (c + 1)) + 1.0 for t, c in document_frequency.items()}
-    max_idf = math.log(n_documents + 1) + 1.0
-    return idf, max_idf
+def _numeric_pair(left: ProductView, right: ProductView, field: str) -> tuple[float, float, float, float, float]:
+    a = left.numeric_fields.get(field, ())
+    b = right.numeric_fields.get(field, ())
+    both = float(bool(a) and bool(b))
+    if not a or not b:
+        return both, 0.0, 0.0, 0.0, 0.0
+    best = min(abs(x - y) for x in a for y in b)
+    scale = max(1.0, max(abs(x) for x in a), max(abs(y) for y in b))
+    rel = best / scale
+    ratio = min(abs(x) / abs(y) if y else 0.0 for x in a for y in b)
+    equal = float(best <= max(1e-9, 0.005 * scale))
+    return both, equal, best, rel, ratio
 
+def _numeric_aggregate(left: ProductView, right: ProductView) -> tuple[float, float, float, float, float, float, float]:
+    fields = sorted(set(left.numeric_fields) | set(right.numeric_fields))
+    present = 0; equal = 0; conflicts = 0; rel_sum = 0.0; ratio_sum = 0.0; abs_sum = 0.0
+    for f in fields:
+        both, eq, diff, rel, ratio = _numeric_pair(left, right, f)
+        if both:
+            present += 1
+            equal += int(eq)
+            conflicts += int(diff > 0 and eq == 0)
+            rel_sum += rel; ratio_sum += ratio; abs_sum += diff
+    return float(present), float(equal), float(conflicts), rel_sum / max(1, present), ratio_sum / max(1, present), abs_sum / max(1, present), float(len(fields))
 
-def _weighted_overlap(
-    left: frozenset[str], right: frozenset[str], idf: dict[str, float]
-) -> tuple[float, float]:
+def _identifier_stats(left: frozenset[str], right: frozenset[str]) -> tuple[float, float, float, float, float]:
+    exact = float(bool(left and right and (left & right)))
+    contain = _set_stats(left, right)[0]
+    disjoint = float(bool(left and right) and not (left & right))
+    presence_equal = float(bool(left) == bool(right))
+    char = _set_stats(frozenset("".join(sorted(left))), frozenset("".join(sorted(right))))[0] if left and right else 0.0
+    return exact, contain, disjoint, presence_equal, char
+
+def _critical_fields(category: str) -> set[str]:
+    key = category.lower()
+    for cat, fields in CATEGORY_CRITICAL_FIELDS.items():
+        if cat in key or key in cat:
+            return set(fields)
+    return {"identifier", "model", "type", "package_quantity", "weight", "volume", "product_dimension"}
+
+def _pair_features(left: ProductView, right: ProductView) -> list[float]:
+    name = _set_stats(left.name_tokens, right.name_tokens)
+    grams3 = _set_stats(left.name_grams, right.name_grams)
+    grams4 = _set_stats(left.name_grams4, right.name_grams4)
+    values = _set_stats(left.value_tokens, right.value_tokens)
+    all_tokens = _set_stats(left.all_tokens, right.all_tokens)
+    keys = _set_stats(left.attr_keys, right.attr_keys)
+    weighted_name_j, weighted_name_c = _weighted_set_overlap(left.name_tokens, right.name_tokens)
+
+    category = left.category or right.category
+    critical = _critical_fields(category)
+    field_sim, field_coverage, field_conflicts, shared_fields = _field_similarity_dict(left.canonical_fields, right.canonical_fields)
+
+    digits = _set_stats(left.digit_tokens, right.digit_tokens)
+    articles = _identifier_stats(left.article_tokens, right.article_tokens)
+    brands = _set_stats(left.brand_tokens, right.brand_tokens)
+    colors = _set_stats(left.color_tokens, right.color_tokens)
+    sizes = _set_stats(left.size_tokens, right.size_tokens)
+    types = _set_stats(left.type_tokens, right.type_tokens)
+    compositions = _set_stats(left.composition_tokens, right.composition_tokens)
+
+    both_digits = bool(left.digit_tokens and right.digit_tokens)
+    both_brands = bool(left.brand_tokens and right.brand_tokens)
+
+    exact_shared = 0; weighted_exact = 0.0; weighted_total = 0.0; critical_conflicts = 0
+    for f in set(left.canonical_fields) | set(right.canonical_fields):
+        lv = left.canonical_fields.get(f); rv = right.canonical_fields.get(f)
+        w = FIELD_WEIGHT.get(f, 1.0)
+        if lv and rv:
+            sim = _set_stats(frozenset(lv), frozenset(rv))[0]
+            weighted_total += w
+            weighted_exact += w * float(sim == 1.0)
+            exact_shared += int(sim == 1.0)
+            if f in critical and sim == 0.0:
+                critical_conflicts += 1
+
+    num_present, num_equal, num_conflict, num_rel, num_ratio, num_abs, num_field_count = _numeric_aggregate(left, right)
+
+    name_brand = _set_stats(left.name_tokens, right.brand_tokens)
+    rev_name_brand = _set_stats(right.name_tokens, left.brand_tokens)
+    name_article = _set_stats(left.name_tokens, right.article_tokens)
+    rev_name_article = _set_stats(right.name_tokens, left.article_tokens)
+    name_model = _set_stats(left.name_tokens, right.model_tokens)
+    rev_name_model = _set_stats(right.name_tokens, left.model_tokens)
+
+    shared_key_n = len(left.attr_keys & right.attr_keys)
+    union_key_n = len(left.attr_keys | right.attr_keys)
+    missing_left = len(right.attr_keys - left.attr_keys)
+    missing_right = len(left.attr_keys - right.attr_keys)
+    critical_present_left = len(left.field_presence & critical)
+    critical_present_right = len(right.field_presence & critical)
+    critical_shared = len((left.field_presence & right.field_presence) & critical)
+
+    seq_lcs = _lcs_ratio(left.ordered_tokens, right.ordered_tokens)
+    prefix = _common_prefix_tokens(left.ordered_tokens, right.ordered_tokens)
+    contains_tokens = float(bool(left.name_tokens and left.name_tokens <= right.name_tokens) or bool(right.name_tokens and right.name_tokens <= left.name_tokens))
+    name_exact = float(bool(left.name) and left.name == right.name)
+    compact_exact = float(bool(left.compact_name) and left.compact_name == right.compact_name)
+    category_exact = float(bool(left.category) and bool(right.category) and left.category == right.category)
+
+    return [
+        name_exact, compact_exact, float(((left.name in right.name) or (right.name in left.name)) if left.name and right.name else False),
+        *name, grams3[0], grams3[2], grams4[0], grams4[2],
+        min(len(left.name), len(right.name)) / max(len(left.name), len(right.name)) if left.name and right.name else 0.0,
+        contains_tokens, seq_lcs, prefix, weighted_name_j, weighted_name_c,
+        values[0], values[2], values[3], all_tokens[0], all_tokens[2], all_tokens[3],
+        keys[0], keys[2], keys[3],
+        field_sim, field_coverage, float(exact_shared) / max(1, shared_fields),
+        weighted_exact / max(1e-9, weighted_total), float(field_conflicts),
+        float(shared_key_n), float(shared_key_n / max(1, union_key_n)), float(missing_left), float(missing_right),
+        digits[0], digits[2], digits[3], float(len(left.digit_tokens ^ right.digit_tokens) if both_digits else 0.0),
+        float(both_digits and not (left.digit_tokens & right.digit_tokens)), float(bool(left.digit_tokens) == bool(right.digit_tokens)),
+        num_present, num_equal, num_conflict, num_rel, num_ratio, num_abs, num_field_count,
+        *articles,
+        *_identifier_stats(left.model_tokens, right.model_tokens),
+        *_identifier_stats(left.sku_tokens, right.sku_tokens),
+        *_identifier_stats(left.oem_tokens, right.oem_tokens),
+        float((left.article_tokens | left.model_tokens) & (right.article_tokens | right.model_tokens) != frozenset()),
+        float(critical_conflicts), float(critical_conflicts > 0),
+        float(critical_shared), float(critical_shared / max(1, len(critical))),
+        brands[0], brands[2], float(both_brands and left.brand_tokens == right.brand_tokens),
+        float(both_brands and not (left.brand_tokens & right.brand_tokens)), float(bool(left.brand_tokens) == bool(right.brand_tokens)),
+        colors[0], colors[2], float(bool(left.color_tokens and right.color_tokens and not (left.color_tokens & right.color_tokens))),
+        sizes[0], sizes[2], types[0], types[2], compositions[0], compositions[2],
+        *_numeric_pair(left, right, "mass_g"),
+        *_numeric_pair(left, right, "volume_ml"),
+        *_numeric_pair(left, right, "quantity"),
+        *_numeric_pair(left, right, "product_dimension"),
+        *_numeric_pair(left, right, "package_quantity"),
+        *_numeric_pair(left, right, "power_w"),
+        *_numeric_pair(left, right, "optical_power"),
+        *_numeric_pair(left, right, "cylinder"),
+        *_numeric_pair(left, right, "axis"),
+        *_numeric_pair(left, right, "radius"),
+        *_numeric_pair(left, right, "shoe_size_ru"),
+        *_numeric_pair(left, right, "manufacturer_size"),
+        max(name_brand[0], rev_name_brand[0]), max(name_brand[2], rev_name_brand[2]),
+        max(name_article[0], rev_name_article[0]), max(name_article[2], rev_name_article[2]),
+        max(name_model[0], rev_name_model[0]), max(name_model[2], rev_name_model[2]),
+        float(category_exact),
+        float(critical_present_left / max(1, len(critical))), float(critical_present_right / max(1, len(critical))),
+    ]
+
+def _document_frequency(items: pd.DataFrame) -> tuple[dict[str, int], dict[str, int], int]:
+    name_df: dict[str, int] = {}
+    attr_df: dict[str, int] = {}
+    total = 0
+    for row in items[["name", "attributes"]].itertuples(index=False, name=None):
+        name, raw_attrs = row
+        total += 1
+        name_tokens = _tokens(_normalise(name))
+        for token in name_tokens:
+            name_df[token] = name_df.get(token, 0) + 1
+        
+        attrs = _parse_attributes(raw_attrs)
+        value_tokens = set()
+        for value in attrs.values():
+            value_tokens.update(value.split())
+        for token in value_tokens:
+            attr_df[token] = attr_df.get(token, 0) + 1
+    return name_df, attr_df, total
+
+def _weighted_overlap(left: frozenset[str], right: frozenset[str], idf: dict[str, float]) -> tuple[float, float]:
     if not left or not right:
         return 0.0, 0.0
     weight_inter = sum(idf.get(t, 1.0) for t in left & right)
     weight_union = sum(idf.get(t, 1.0) for t in left | right)
-    weight_min = min(
-        sum(idf.get(t, 1.0) for t in left), sum(idf.get(t, 1.0) for t in right)
-    )
+    weight_min = min(sum(idf.get(t, 1.0) for t in left), sum(idf.get(t, 1.0) for t in right))
     jaccard = weight_inter / weight_union if weight_union else 0.0
     containment = weight_inter / weight_min if weight_min else 0.0
     return jaccard, containment
 
-
-def _set_stats(left: frozenset[str], right: frozenset[str]) -> tuple[float, float, float, float]:
-    if not left and not right:
-        return 0.0, 0.0, 0.0, 0.0
-    common = len(left & right)
-    union = len(left | right)
-    jaccard = common / union if union else 0.0
-    dice = 2.0 * common / (len(left) + len(right)) if left or right else 0.0
-    containment = common / min(len(left), len(right)) if left and right else 0.0
-    count_ratio = min(len(left), len(right)) / max(len(left), len(right)) if left and right else 0.0
-    return jaccard, dice, containment, count_ratio
-
-
-def _extra_features(
-    left: ProductView,
-    right: ProductView,
-    name_idf: dict[str, float],
-    name_max_idf: float,
-    attr_idf: dict[str, float],
-) -> list[float]:
-    """IDF-weighted, numeric and finer-grained relational signals."""
-    left_names, right_names = left.name_tokens, right.name_tokens
-
-    idf_jaccard, idf_containment = _weighted_overlap(left_names, right_names, name_idf)
-
-    shared = left_names & right_names
-    only = (left_names - right_names) | (right_names - left_names)
-    max_shared = max((name_idf.get(t, 1.0) for t in shared), default=0.0) / name_max_idf
-    max_unshared = max((name_idf.get(t, 1.0) for t in only), default=0.0) / name_max_idf
-    # Ничьи разрешаются самим словом: без этого max() берёт первый элемент в порядке
-    # перебора множества, а он зависит от хеш-соли процесса. Признак получался разным
-    # при обучении и в production просто потому, что это разные запуски Python.
-    rarest_left = max(left_names, key=lambda t: (name_idf.get(t, 1.0), t)) if left_names else None
-    rarest_right = max(right_names, key=lambda t: (name_idf.get(t, 1.0), t)) if right_names else None
+def _extra_features(left: ProductView, right: ProductView, name_idf: dict[str, float], name_max_idf: float, attr_idf: dict[str, float]) -> list[float]:
+    idf_jaccard, idf_containment = _weighted_overlap(left.name_tokens, right.name_tokens, name_idf)
+    shared = left.name_tokens & right.name_tokens
+    only = (left.name_tokens - right.name_tokens) | (right.name_tokens - left.name_tokens)
+    max_shared = max((name_idf.get(t, 1.0) for t in shared), default=0.0) / name_max_idf if name_max_idf else 0.0
+    max_unshared = max((name_idf.get(t, 1.0) for t in only), default=0.0) / name_max_idf if name_max_idf else 0.0
+    
+    rarest_left = max(left.name_tokens, key=lambda t: (name_idf.get(t, 1.0), t)) if left.name_tokens else None
+    rarest_right = max(right.name_tokens, key=lambda t: (name_idf.get(t, 1.0), t)) if right.name_tokens else None
     rarest_shared = float(
-        rarest_left is not None and rarest_left in right_names
-        and rarest_right is not None and rarest_right in left_names
+        rarest_left is not None and rarest_left in right.name_tokens
+        and rarest_right is not None and rarest_right in left.name_tokens
     )
-
-    intersection = len(shared)
-    extra_left = len(left_names - right_names)
-    extra_right = len(right_names - left_names)
-    denom = intersection + extra_left + extra_right
-    extra_min = min(extra_left, extra_right) / denom if denom else 0.0
-    extra_max = max(extra_left, extra_right) / denom if denom else 0.0
-
-    left_nums, right_nums = left.num_values, right.num_values
-    if left_nums and right_nums:
-        common = len(left_nums & right_nums)
-        num_jaccard = common / len(left_nums | right_nums)
-        num_containment = common / min(len(left_nums), len(right_nums))
-        num_disjoint = float(common == 0)
-    else:
-        num_jaccard = num_containment = num_disjoint = 0.0
-    num_presence_equal = float(bool(left_nums) == bool(right_nums))
-
-    grams4 = _set_stats(left.name_grams4, right.name_grams4)
-    grams5 = _set_stats(left.name_grams5, right.name_grams5)
-
     attr_jaccard, attr_containment = _weighted_overlap(left.value_tokens, right.value_tokens, attr_idf)
-
-    left_tokens_list = left.name.split()
-    right_tokens_list = right.name.split()
-    first_match = float(
-        bool(left_tokens_list) and bool(right_tokens_list)
-        and left_tokens_list[0] == right_tokens_list[0]
-    )
-    last_match = float(
-        bool(left_tokens_list) and bool(right_tokens_list)
-        and left_tokens_list[-1] == right_tokens_list[-1]
-    )
-
-    size = _class_conflict(left.size_tokens, right.size_tokens)
-    color = _class_conflict(left.color_tokens, right.color_tokens)
-    gender = _class_conflict(left.gender_tokens, right.gender_tokens)
-    any_conflict = float(bool(size[2] or color[2] or gender[2]))
-
-    quantity = _quantity_features(left.quantities, right.quantities)
-    v10 = _v10_feature_values(
-        left.compact_identifiers,
-        right.compact_identifiers,
-        left.family_attrs,
-        right.family_attrs,
-    )
-    v11 = _v11_feature_values(
-        left.name_identifiers,
-        right.name_identifiers,
-        left.value_phrases,
-        right.value_phrases,
-        left.key_value_pairs,
-        right.key_value_pairs,
-        left.semantic_values,
-        right.semantic_values,
-    )
-    v12 = _v12_feature_values(
-        left.name_tokens,
-        right.name_tokens,
-        left.attr_keys,
-        right.attr_keys,
-        left.value_tokens,
-        right.value_tokens,
-        left.value_phrases,
-        right.value_phrases,
-        left.key_value_pairs,
-        right.key_value_pairs,
-        left.name_identifiers,
-        right.name_identifiers,
-        left.compact_identifiers,
-        right.compact_identifiers,
-    )
-    v13 = _v13_feature_values(
-        left.name,
-        right.name,
-        left.attrs,
-        right.attrs,
-        left.digit_tokens,
-        right.digit_tokens,
-        left.article_tokens,
-        right.article_tokens,
-        left.compact_identifiers,
-        right.compact_identifiers,
-        left.quantities,
-        right.quantities,
-    )
-
-    return [
-        idf_jaccard, idf_containment,
-        extra_min, extra_max,
-        num_jaccard, num_containment, num_disjoint, num_presence_equal,
-        grams4[0], grams4[2],
-        first_match, last_match,
-        max_shared, max_unshared, rarest_shared,
-        attr_jaccard, attr_containment,
-        grams5[0], grams5[2],
-        *size, *color, *gender, any_conflict,
-        *quantity,
-        *v10,
-        *v11,
-        *v12,
-        *v13,
-    ]
-
-
-def _quantity_features(left: frozenset[str], right: frozenset[str]) -> tuple[float, ...]:
-    """(jaccard, containment, disjoint, presence_equal, same_dimension_conflict)."""
-    presence_equal = float(bool(left) == bool(right))
-    if not left or not right:
-        return 0.0, 0.0, 0.0, presence_equal, 0.0
-    common = len(left & right)
-    jaccard = common / len(left | right)
-    containment = common / min(len(left), len(right))
-    disjoint = float(common == 0)
-    left_dims = {q.split(":", 1)[0] for q in left}
-    right_dims = {q.split(":", 1)[0] for q in right}
-    dimension_conflict = 0.0
-    for dimension in left_dims & right_dims:
-        prefix = dimension + ":"
-        left_values = {q for q in left if q.startswith(prefix)}
-        right_values = {q for q in right if q.startswith(prefix)}
-        if left_values and right_values and not (left_values & right_values):
-            dimension_conflict = 1.0
-            break
-    return jaccard, containment, disjoint, presence_equal, dimension_conflict
-
-
-def _class_conflict(left: frozenset[str], right: frozenset[str]) -> tuple[float, float, float, float]:
-    """(jaccard, containment, disjoint, presence_equal) for one attribute class."""
-    presence_equal = float(bool(left) == bool(right))
-    if not left or not right:
-        return 0.0, 0.0, 0.0, presence_equal
-    common = len(left & right)
-    jaccard = common / len(left | right)
-    containment = common / min(len(left), len(right))
-    disjoint = float(common == 0)
-    return jaccard, containment, disjoint, presence_equal
-
-
-V10_FEATURE_NAMES = [
-    "compact_id_jaccard", "compact_id_containment", "compact_id_match", "compact_id_disjoint",
-    "compact_id_presence_equal",
-    "size_key_exact", "size_key_jaccard", "size_key_conflict", "size_key_presence_equal",
-    "color_key_exact", "color_key_jaccard", "color_key_conflict", "color_key_presence_equal",
-    "gender_key_exact", "gender_key_jaccard", "gender_key_conflict", "gender_key_presence_equal",
-    "type_key_exact", "type_key_jaccard", "type_key_conflict", "type_key_presence_equal",
-    "model_key_exact", "model_key_jaccard", "model_key_conflict", "model_key_presence_equal",
-]
-
-V11_FEATURE_NAMES = [
-    "name_id_jaccard", "name_id_containment", "name_id_match", "name_id_disjoint",
-    "name_id_presence_equal",
-    "value_phrase_jaccard", "value_phrase_dice", "value_phrase_containment",
-    "value_phrase_count_ratio",
-    "key_value_jaccard", "key_value_dice", "key_value_containment", "key_value_count_ratio",
-    "type_value_jaccard", "type_value_containment", "type_value_disjoint", "type_value_presence_equal",
-    "model_value_jaccard", "model_value_containment", "model_value_disjoint", "model_value_presence_equal",
-    "material_value_jaccard", "material_value_containment", "material_value_disjoint",
-    "material_value_presence_equal",
-    "collection_value_jaccard", "collection_value_containment", "collection_value_disjoint",
-    "collection_value_presence_equal",
-]
-
-V12_FEATURE_NAMES = [
-    "name_count_min_log", "name_count_max_log", "name_count_diff_log",
-    "attr_key_count_min_log", "attr_key_count_max_log", "attr_key_count_diff_log",
-    "value_token_count_min_log", "value_token_count_max_log", "value_token_count_diff_log",
-    "value_phrase_count_min_log", "value_phrase_count_max_log", "value_phrase_count_diff_log",
-    "shared_value_phrase_count_log", "shared_key_value_count_log",
-    "shared_name_id_count_log", "shared_compact_id_count_log",
-    "attr_presence_asymmetric", "name_id_presence_asymmetric",
-]
-
-V13_FEATURE_NAMES = [
-    "digit_count_min_log", "digit_count_max_log", "digit_count_diff_log",
-    "article_count_min_log", "article_count_max_log", "article_count_diff_log",
-    "compact_id_count_min_log", "compact_id_count_max_log", "compact_id_count_diff_log",
-    "quantity_count_min_log", "quantity_count_max_log", "quantity_count_diff_log",
-    "name_char_min_log", "name_char_max_log", "name_char_diff_log",
-    "attr_char_min_log", "attr_char_max_log", "attr_char_diff_log",
-    "shared_key_count_log", "shared_exact_value_count_log", "shared_conflict_count_log",
-]
-
-
-EXTRA_FEATURE_NAMES = [
-    "idf_name_jaccard", "idf_name_containment",
-    "name_extra_min", "name_extra_max",
-    "num_jaccard", "num_containment", "num_disjoint", "num_presence_equal",
-    "name_char4_jaccard", "name_char4_containment",
-    "name_first_match", "name_last_match",
-    "idf_max_shared", "idf_max_unshared", "idf_rarest_shared",
-    "attr_idf_jaccard", "attr_idf_containment",
-    "name_char5_jaccard", "name_char5_containment",
-    "size_jaccard", "size_containment", "size_disjoint", "size_presence_equal",
-    "color_jaccard", "color_containment", "color_disjoint", "color_presence_equal",
-    "gender_jaccard", "gender_containment", "gender_disjoint", "gender_presence_equal",
-    "any_class_conflict",
-    "qty_jaccard", "qty_containment", "qty_disjoint", "qty_presence_equal", "qty_dim_conflict",
-] + V10_FEATURE_NAMES + V11_FEATURE_NAMES + V12_FEATURE_NAMES + V13_FEATURE_NAMES
-
-
-def _pair_features(left: ProductView, right: ProductView) -> list[float]:
-    name = _set_stats(left.name_tokens, right.name_tokens)
-    grams = _set_stats(left.name_grams, right.name_grams)
-    values = _set_stats(left.value_tokens, right.value_tokens)
-    all_tokens = _set_stats(left.all_tokens, right.all_tokens)
-    keys = _set_stats(left.attr_keys, right.attr_keys)
-    digits = _set_stats(left.digit_tokens, right.digit_tokens)
-    articles = _set_stats(left.article_tokens, right.article_tokens)
-    brands = _set_stats(left.brand_tokens, right.brand_tokens)
-
-    shared_keys = left.attr_keys & right.attr_keys
-    exact_values = 0
-    value_similarity = 0.0
-    conflicts = 0
-    for key in shared_keys:
-        l_value = left.attrs[key]
-        r_value = right.attrs[key]
-        exact_values += int(l_value == r_value)
-        similarity = _set_stats(_tokens(l_value), _tokens(r_value))[0]
-        value_similarity += similarity
-        conflicts += int(similarity == 0.0)
-    shared_n = len(shared_keys)
-
-    both_digits = bool(left.digit_tokens and right.digit_tokens)
-    both_articles = bool(left.article_tokens and right.article_tokens)
-    both_brands = bool(left.brand_tokens and right.brand_tokens)
-    name_len_ratio = (
-        min(len(left.name), len(right.name)) / max(len(left.name), len(right.name))
-        if left.name and right.name else 0.0
-    )
-
-    return [
-        float(bool(left.name) and left.name == right.name),
-        *name,
-        grams[0], grams[2],
-        name_len_ratio,
-        values[0], values[2], values[3],
-        all_tokens[0], all_tokens[2], all_tokens[3],
-        keys[0], keys[2], keys[3],
-        exact_values / shared_n if shared_n else 0.0,
-        value_similarity / shared_n if shared_n else 0.0,
-        conflicts / shared_n if shared_n else 0.0,
-        min(shared_n / 10.0, 1.0),
-        digits[0], digits[2], digits[3],
-        float(both_digits and not (left.digit_tokens & right.digit_tokens)),
-        float(bool(left.digit_tokens) == bool(right.digit_tokens)),
-        articles[0], articles[2], articles[3],
-        float(both_articles and not (left.article_tokens & right.article_tokens)),
-        float(bool(left.article_tokens) == bool(right.article_tokens)),
-        brands[0], brands[2],
-        float(both_brands and left.brand_tokens == right.brand_tokens),
-        float(both_brands and not (left.brand_tokens & right.brand_tokens)),
-        float(bool(left.brand_tokens) == bool(right.brand_tokens)),
-    ]
-
+    return [idf_jaccard, idf_containment, max_shared, max_unshared, rarest_shared, attr_jaccard, attr_containment]
 
 FEATURE_NAMES = [
-    "name_exact", "name_jaccard", "name_dice", "name_containment", "name_count_ratio",
-    "name_char3_jaccard", "name_char3_containment", "name_length_ratio",
+    "name_exact", "name_compact_exact", "name_str_contains",
+    "name_jaccard", "name_dice", "name_containment", "name_count_ratio",
+    "name_char3_jaccard", "name_char3_containment", "name_char4_jaccard", "name_char4_containment",
+    "name_length_ratio", "name_token_full_contains", "name_lcs_ratio", "name_common_prefix_ratio",
+    "name_weighted_jaccard", "name_weighted_containment",
     "value_jaccard", "value_containment", "value_count_ratio",
     "all_jaccard", "all_containment", "all_count_ratio",
     "key_jaccard", "key_containment", "key_count_ratio",
-    "shared_value_exact", "shared_value_jaccard", "shared_value_conflict", "shared_key_count",
-    "digit_jaccard", "digit_containment", "digit_count_ratio", "digit_disjoint", "digit_presence_equal",
-    "article_jaccard", "article_containment", "article_count_ratio", "article_disjoint",
-    "article_presence_equal", "brand_jaccard", "brand_containment", "brand_exact",
-    "brand_disjoint", "brand_presence_equal",
-] + EXTRA_FEATURE_NAMES
+    "field_weighted_similarity", "field_weighted_coverage", "shared_field_exact_ratio",
+    "weighted_shared_exact", "field_conflict_count",
+    "shared_key_count", "shared_key_ratio", "missing_key_left", "missing_key_right",
+    "digit_jaccard", "digit_containment", "digit_count_ratio", "digit_sym_diff", "digit_disjoint", "digit_presence_equal",
+    "numeric_both_field_count", "numeric_equal_field_count", "numeric_conflict_field_count", "numeric_mean_rel_diff", "numeric_mean_ratio", "numeric_mean_abs_diff", "numeric_field_union_count",
+    "article_exact", "article_containment", "article_disjoint", "article_presence_equal", "article_char_similarity",
+    "model_exact", "model_containment", "model_disjoint", "model_presence_equal", "model_char_similarity",
+    "sku_exact", "sku_containment", "sku_disjoint", "sku_presence_equal", "sku_char_similarity",
+    "oem_exact", "oem_containment", "oem_disjoint", "oem_presence_equal", "oem_char_similarity",
+    "identifier_cross_exact", "critical_conflict_count", "critical_conflict_any", "critical_shared_count", "critical_shared_ratio",
+    "brand_jaccard", "brand_containment", "brand_exact", "brand_disjoint", "brand_presence_equal",
+    "color_jaccard", "color_containment", "color_conflict",
+    "size_jaccard", "size_containment", "type_jaccard", "type_containment",
+    "composition_jaccard", "composition_containment",
+]
 
+_NUMERIC_FEATURE_TEMPLATE = (
+    "mass_g", "volume_ml", "quantity", "product_dimension", "package_quantity", "power_w",
+    "optical_power", "cylinder", "axis", "radius", "shoe_size_ru", "manufacturer_size"
+)
+for _field in _NUMERIC_FEATURE_TEMPLATE:
+    FEATURE_NAMES.extend([
+        f"{_field}_both", f"{_field}_equal", f"{_field}_abs_diff", f"{_field}_rel_diff", f"{_field}_ratio",
+    ])
+
+FEATURE_NAMES.extend([
+    "name_x_brand_jaccard", "name_x_brand_containment",
+    "name_x_article_jaccard", "name_x_article_containment",
+    "name_x_model_jaccard", "name_x_model_containment",
+    "category_exact", "critical_coverage_left", "critical_coverage_right",
+])
+
+EXTRA_FEATURE_NAMES = [
+    "idf_name_jaccard", "idf_name_containment", "idf_max_shared", "idf_max_unshared", "idf_rarest_shared",
+    "attr_idf_jaccard", "attr_idf_containment"
+]
+
+FEATURE_NAMES.extend(EXTRA_FEATURE_NAMES)
 MODEL_FEATURE_NAMES = FEATURE_NAMES + ["text_tfidf", "name_tfidf"]
-
-
-def extract_pair_features(matches: pd.DataFrame, items: pd.DataFrame) -> np.ndarray:
-    """Return a dense float32 feature matrix in input-pair order."""
-    views = build_product_views(items)
-    name_idf, name_max_idf = _build_idf(views.values(), attr=False)
-    attr_idf, _ = _build_idf(views.values(), attr=True)
-    result = np.empty((len(matches), len(FEATURE_NAMES)), dtype=np.float32)
-    for row, (id1, id2) in enumerate(matches[["id1", "id2"]].itertuples(index=False, name=None)):
-        left = views.get(int(id1), EMPTY_VIEW)
-        right = views.get(int(id2), EMPTY_VIEW)
-        result[row] = _pair_features(left, right) + _extra_features(
-            left, right, name_idf, name_max_idf, attr_idf
-        )
-    return result
-
-
-def extract_v10_pair_features(matches: pd.DataFrame, items: pd.DataFrame) -> np.ndarray:
-    """Compute only the incremental v10 block for fast feature experiments."""
-    lightweight: dict[
-        int, tuple[frozenset[str], tuple[dict[str, str], ...]]
-    ] = {}
-    for item_id, raw_attrs in items[["id", "attributes"]].itertuples(
-        index=False, name=None
-    ):
-        attrs = _parse_attributes(raw_attrs)
-        lightweight[int(item_id)] = (
-            _compact_identifier_tokens(attrs),
-            _family_attributes(attrs),
-        )
-    empty = (frozenset(), ({}, {}, {}, {}, {}))
-    result = np.empty((len(matches), len(V10_FEATURE_NAMES)), dtype=np.float32)
-    for row, (id1, id2) in enumerate(
-        matches[["id1", "id2"]].itertuples(index=False, name=None)
-    ):
-        left_ids, left_families = lightweight.get(int(id1), empty)
-        right_ids, right_families = lightweight.get(int(id2), empty)
-        result[row] = _v10_feature_values(
-            left_ids, right_ids, left_families, right_families
-        )
-    return result
-
-
-def extract_v11_pair_features(matches: pd.DataFrame, items: pd.DataFrame) -> np.ndarray:
-    """Compute only the incremental v11 block for fast feature experiments."""
-    lightweight: dict[int, tuple] = {}
-    for item_id, name, raw_attrs in items[["id", "name", "attributes"]].itertuples(
-        index=False, name=None
-    ):
-        norm_name = _normalise(name)
-        attrs = _parse_attributes(raw_attrs)
-        lightweight[int(item_id)] = (
-            _compact_name_identifiers(norm_name),
-            frozenset(attrs.values()),
-            frozenset(f"{key}={value}" for key, value in attrs.items()),
-            _semantic_value_groups(attrs),
-        )
-    empty = (
-        frozenset(), frozenset(), frozenset(), (frozenset(),) * 4
-    )
-    result = np.empty((len(matches), len(V11_FEATURE_NAMES)), dtype=np.float32)
-    for row, (id1, id2) in enumerate(
-        matches[["id1", "id2"]].itertuples(index=False, name=None)
-    ):
-        left = lightweight.get(int(id1), empty)
-        right = lightweight.get(int(id2), empty)
-        result[row] = _v11_feature_values(
-            left[0], right[0], left[1], right[1], left[2], right[2], left[3], right[3]
-        )
-    return result
-
-
-def extract_v12_pair_features(matches: pd.DataFrame, items: pd.DataFrame) -> np.ndarray:
-    """Compute only the incremental v12 density/count block."""
-    lightweight: dict[int, tuple] = {}
-    for item_id, name, raw_attrs in items[["id", "name", "attributes"]].itertuples(
-        index=False, name=None
-    ):
-        norm_name = _normalise(name)
-        name_tokens = _tokens(norm_name)
-        attrs = _parse_attributes(raw_attrs)
-        value_tokens = frozenset(
-            token for value in attrs.values() for token in value.split()
-        )
-        lightweight[int(item_id)] = (
-            name_tokens,
-            frozenset(attrs),
-            value_tokens,
-            frozenset(attrs.values()),
-            frozenset(f"{key}={value}" for key, value in attrs.items()),
-            _compact_name_identifiers(norm_name),
-            _compact_identifier_tokens(attrs),
-        )
-    empty = (frozenset(),) * 7
-    result = np.empty((len(matches), len(V12_FEATURE_NAMES)), dtype=np.float32)
-    for row, (id1, id2) in enumerate(
-        matches[["id1", "id2"]].itertuples(index=False, name=None)
-    ):
-        left = lightweight.get(int(id1), empty)
-        right = lightweight.get(int(id2), empty)
-        result[row] = _v12_feature_values(
-            left[0], right[0], left[1], right[1], left[2], right[2],
-            left[3], right[3], left[4], right[4], left[5], right[5],
-            left[6], right[6],
-        )
-    return result
-
-
-def extract_v13_pair_features(matches: pd.DataFrame, items: pd.DataFrame) -> np.ndarray:
-    """Compute only the incremental v13 absolute-density block."""
-    lightweight: dict[int, tuple] = {}
-    for item_id, name, raw_attrs in items[["id", "name", "attributes"]].itertuples(
-        index=False, name=None
-    ):
-        norm_name = _normalise(name)
-        attrs = _parse_attributes(raw_attrs)
-        all_tokens = _tokens(norm_name) | frozenset(
-            token for value in attrs.values() for token in value.split()
-        )
-        lightweight[int(item_id)] = (
-            norm_name,
-            attrs,
-            frozenset(token for token in all_tokens if any(char.isdigit() for char in token)),
-            _selected_values(attrs, ARTICLE_KEYS),
-            _compact_identifier_tokens(attrs),
-            _extract_quantities(name, raw_attrs),
-        )
-    empty = ("", {}, frozenset(), frozenset(), frozenset(), frozenset())
-    result = np.empty((len(matches), len(V13_FEATURE_NAMES)), dtype=np.float32)
-    for row, (id1, id2) in enumerate(
-        matches[["id1", "id2"]].itertuples(index=False, name=None)
-    ):
-        left = lightweight.get(int(id1), empty)
-        right = lightweight.get(int(id2), empty)
-        result[row] = _v13_feature_values(
-            left[0], right[0], left[1], right[1], left[2], right[2],
-            left[3], right[3], left[4], right[4], left[5], right[5],
-        )
-    return result
-
-
-def _document_frequency(items: pd.DataFrame) -> tuple[dict[str, int], dict[str, int], int]:
-    """Счётчики документной частоты по куску карточек; складываются между кусками."""
-    name_df: dict[str, int] = {}
-    attr_df: dict[str, int] = {}
-    total = 0
-    for view in build_product_views(items).values():
-        total += 1
-        for token in view.name_tokens:
-            name_df[token] = name_df.get(token, 0) + 1
-        for token in view.value_tokens:
-            attr_df[token] = attr_df.get(token, 0) + 1
-    return name_df, attr_df, total
-
 
 def _features_for_chunk(payload: tuple) -> np.ndarray:
     matches, items, name_idf, name_max_idf, attr_idf = payload
@@ -969,80 +689,70 @@ def _features_for_chunk(payload: tuple) -> np.ndarray:
     for row, (id1, id2) in enumerate(matches[["id1", "id2"]].itertuples(index=False, name=None)):
         left = views.get(int(id1), EMPTY_VIEW)
         right = views.get(int(id2), EMPTY_VIEW)
-        result[row] = _pair_features(left, right) + _extra_features(
-            left, right, name_idf, name_max_idf, attr_idf
-        )
+        result[row] = _pair_features(left, right) + _extra_features(left, right, name_idf, name_max_idf, attr_idf)
     return result
 
-
-def extract_pair_features_parallel(
-    matches: pd.DataFrame, items: pd.DataFrame, workers: int | None = None
-) -> np.ndarray:
-    """То же, что extract_pair_features, но на всех ядрах.
-
-    Разбор карточек занимает 72% времени извлечения признаков — около 300 секунд на
-    Private при лимите 780, и всё это в один поток при двадцати доступных ядрах.
-
-    Прямое разбиение по парам даёт неверный результат: шесть признаков опираются на
-    IDF, то есть на редкость слова во ВСЁМ корпусе прогона, а каждый работник считал бы
-    её по своему куску. Поэтому проход двойной: сначала параллельно собираются счётчики
-    частот и складываются в общий словарь, затем с ним считаются признаки. Карточки
-    разбираются дважды, но обе фазы параллельны, так что выигрыш сохраняется.
-    """
-    import math
+def extract_pair_features_parallel(matches: pd.DataFrame, items: pd.DataFrame, workers: int | None = None) -> np.ndarray:
     import os
     from concurrent.futures import ProcessPoolExecutor
 
     workers = workers or min(os.cpu_count() or 1, 20)
-    if workers <= 1 or len(matches) < 20_000:
-        return extract_pair_features(matches, items)
-
-    item_chunks = [items.iloc[idx].reset_index(drop=True)
-                   for idx in np.array_split(np.arange(len(items)), workers)]
+    
+    item_chunks = [items.iloc[idx].reset_index(drop=True) for idx in np.array_split(np.arange(len(items)), workers)]
     name_df: dict[str, int] = {}
     attr_df: dict[str, int] = {}
     total = 0
-    with ProcessPoolExecutor(max_workers=workers) as pool:
-        for chunk_name, chunk_attr, chunk_total in pool.map(_document_frequency, item_chunks):
+    if workers > 1 and len(matches) >= 20_000:
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            for chunk_name, chunk_attr, chunk_total in pool.map(_document_frequency, item_chunks):
+                total += chunk_total
+                for token, count in chunk_name.items():
+                    name_df[token] = name_df.get(token, 0) + count
+                for token, count in chunk_attr.items():
+                    attr_df[token] = attr_df.get(token, 0) + count
+    else:
+        for chunk in item_chunks:
+            chunk_name, chunk_attr, chunk_total = _document_frequency(chunk)
             total += chunk_total
             for token, count in chunk_name.items():
                 name_df[token] = name_df.get(token, 0) + count
             for token, count in chunk_attr.items():
                 attr_df[token] = attr_df.get(token, 0) + count
+
     name_idf = {t: math.log((total + 1) / (c + 1)) + 1.0 for t, c in name_df.items()}
     attr_idf = {t: math.log((total + 1) / (c + 1)) + 1.0 for t, c in attr_df.items()}
-    name_max_idf = math.log(total + 1) + 1.0
+    name_max_idf = math.log(total + 1) + 1.0 if total else 0.0
     del name_df, attr_df
 
     row_by_id = {int(item_id): row for row, item_id in enumerate(items["id"].to_numpy())}
     left_ids = matches["id1"].to_numpy()
     right_ids = matches["id2"].to_numpy()
-    payloads = []
-    for index in np.array_split(np.arange(len(matches)), workers * 2):
-        rows = {row_by_id[int(i)] for i in left_ids[index] if int(i) in row_by_id}
-        rows.update(row_by_id[int(i)] for i in right_ids[index] if int(i) in row_by_id)
-        payloads.append((matches.iloc[index].reset_index(drop=True),
-                         items.iloc[sorted(rows)].reset_index(drop=True),
-                         name_idf, name_max_idf, attr_idf))
-    with ProcessPoolExecutor(max_workers=workers) as pool:
-        parts = list(pool.map(_features_for_chunk, payloads))
-    return np.vstack(parts)
-
+    
+    if workers > 1 and len(matches) >= 20_000:
+        payloads = []
+        for index in np.array_split(np.arange(len(matches)), workers * 2):
+            rows = {row_by_id[int(i)] for i in left_ids[index] if int(i) in row_by_id}
+            rows.update(row_by_id[int(i)] for i in right_ids[index] if int(i) in row_by_id)
+            payloads.append((matches.iloc[index].reset_index(drop=True),
+                             items.iloc[sorted(rows)].reset_index(drop=True),
+                             name_idf, name_max_idf, attr_idf))
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            parts = list(pool.map(_features_for_chunk, payloads))
+        return np.vstack(parts)
+    else:
+        return _features_for_chunk((matches, items, name_idf, name_max_idf, attr_idf))
 
 def extract_model_features(matches: pd.DataFrame, items: pd.DataFrame) -> np.ndarray:
-    """Structured features plus two unsupervised lexical cosine signals."""
     from src.data import attach_texts, build_item_text
-    from src.scoring import tfidf_scores
+    from src.scoring import tfidf_wc_scores
 
     structured = extract_pair_features_parallel(matches, items)
-
     text_items = items[["id", "category"]].copy()
     text_items["text"] = build_item_text(items)
     text_pairs = attach_texts(matches, text_items)
     try:
-        text_cosine = tfidf_scores(text_pairs)
+        text_cosine = tfidf_wc_scores(text_pairs)
     except ValueError:
-        # Tiny/empty diagnostic inputs can lose every term at min_df=2.
         text_cosine = np.zeros(len(matches), dtype=np.float32)
 
     id_to_name = dict(zip(items["id"], items["name"].fillna("").astype(str)))
@@ -1050,8 +760,8 @@ def extract_model_features(matches: pd.DataFrame, items: pd.DataFrame) -> np.nda
     name_pairs["text1"] = name_pairs["id1"].map(id_to_name).fillna("")
     name_pairs["text2"] = name_pairs["id2"].map(id_to_name).fillna("")
     try:
-        name_cosine = tfidf_scores(name_pairs, ngram_range=(1, 2), max_features=300_000)
+        name_cosine = tfidf_wc_scores(name_pairs, max_features=300_000)
     except ValueError:
         name_cosine = np.zeros(len(matches), dtype=np.float32)
-
+    
     return np.column_stack((structured, text_cosine, name_cosine)).astype(np.float32)
